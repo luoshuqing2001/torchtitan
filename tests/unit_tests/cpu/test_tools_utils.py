@@ -75,8 +75,11 @@ def test_get_local_device_rejects_out_of_range_rank(
         ((9, 1), "FA3"),
         ((10, 0), "FA4"),
         ((10, 3), "FA4"),
-        # SM 11.0+ falls through to the newest known impl (FA4).
+        # SM 11.x still falls through to FA4. SM120 uses the built-in kernel:
+        # PyTorch's FA4 wrapper rejects compute capability 12.
         ((11, 0), "FA4"),
+        ((12, 0), None),
+        ((12, 1), None),
     ],
 )
 def test_get_cuda_flash_attention_impl(monkeypatch, capability, expected_impl):

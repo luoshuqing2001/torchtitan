@@ -14,17 +14,141 @@ Tensor shape suffixes:
 """
 
 from dataclasses import dataclass
+import logging
 from typing import cast
 
 import spmd_types as spmd
 import torch
 from torch import nn
 from torch.autograd.function import once_differentiable
-
 from torchao.prototype.moe_training.kernels import (
     triton_fp8_per_group_colwise_scales_dual,
     triton_fp8_rowwise_2d_scale_and_cast,
 )
+
+logger = logging.getLogger(__name__)
+
+# torch._scaled_grouped_mm is implemented for Hopper and SM100 Blackwell only.
+# SM120 (RTX PRO Blackwell) accepts torch._scaled_mm, so grouped contraction
+# falls back to one scaled GEMM per expert.
+_SCALED_GROUPED_MM_CC = {(9, 0), (10, 0)}
+_logged_grouped_mm_fallback = False
+
+
+def _supports_scaled_grouped_mm(device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
+    return torch.cuda.get_device_capability(device) in _SCALED_GROUPED_MM_CC
+
+
+def _row_major(t: torch.Tensor) -> torch.Tensor:
+    return t if t.is_contiguous() else t.contiguous()
+
+
+def _column_major(t: torch.Tensor) -> torch.Tensor:
+    if t.stride(0) == 1 and t.stride(1) == t.shape[0]:
+        return t
+    return t.transpose(0, 1).contiguous().transpose(0, 1)
+
+
+def _scaled_mm(lhs: torch.Tensor, rhs: torch.Tensor, scale_a, scale_b, out_dtype):
+    return torch._scaled_mm(
+        _row_major(lhs),
+        _column_major(rhs),
+        scale_a=scale_a.contiguous(),
+        scale_b=scale_b.contiguous(),
+        out_dtype=out_dtype,
+        use_fast_accum=True,
+    )
+
+
+def _per_expert_scaled_grouped_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    offs: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """FP8 grouped GEMM via one ``_scaled_mm`` per expert.
+
+    ``b.ndim == 3`` is ``(tokens, K) @ (E, K, N) -> (tokens, N)``.
+    ``b.ndim == 2`` is the weight-gradient case
+    ``(N, tokens) @ (tokens, K) -> (E, N, K)``, with scales packed
+    group-major as length ``N * E`` and ``K * E``.
+    """
+    ends = offs.tolist()
+    if b.ndim == 3:
+        out = torch.empty(
+            a.shape[0], b.shape[-1], device=a.device, dtype=out_dtype
+        )
+        prev = 0
+        for expert, end in enumerate(ends):
+            if end != prev:
+                sa = scale_a[prev:end]
+                sb = scale_b[expert]
+                out[prev:end] = _scaled_mm(
+                    a[prev:end],
+                    b[expert],
+                    sa.unsqueeze(-1) if sa.ndim == 1 else sa,
+                    sb.unsqueeze(0) if sb.ndim == 1 else sb,
+                    out_dtype,
+                )
+            prev = end
+        return out
+
+    num_experts = offs.numel()
+    out_features = a.shape[0]
+    in_features = b.shape[1]
+    out = torch.zeros(
+        num_experts, out_features, in_features, device=a.device, dtype=out_dtype
+    )
+    scale_a = scale_a.reshape(num_experts, out_features)
+    scale_b = scale_b.reshape(num_experts, in_features)
+    prev = 0
+    for expert, end in enumerate(ends):
+        if end != prev:
+            out[expert] = _scaled_mm(
+                a[:, prev:end],
+                b[prev:end],
+                scale_a[expert].unsqueeze(-1),
+                scale_b[expert].unsqueeze(0),
+                out_dtype,
+            )
+        prev = end
+    return out
+
+
+def _fp8_scaled_grouped_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    offs: torch.Tensor,
+    *,
+    out_dtype: torch.dtype,
+    use_fast_accum: bool,
+) -> torch.Tensor:
+    global _logged_grouped_mm_fallback
+    if _supports_scaled_grouped_mm(a.device):
+        return torch._scaled_grouped_mm(
+            a,
+            b,
+            scale_a,
+            scale_b,
+            offs,
+            out_dtype=out_dtype,
+            use_fast_accum=use_fast_accum,
+        )
+    if not _logged_grouped_mm_fallback:
+        logger.warning(
+            "torch._scaled_grouped_mm does not support compute capability %s; "
+            "running FP8 grouped GEMM as one scaled GEMM per expert",
+            torch.cuda.get_device_capability(a.device),
+        )
+        _logged_grouped_mm_fallback = True
+    return _per_expert_scaled_grouped_mm(a, b, scale_a, scale_b, offs, out_dtype)
+
 
 from .._fsdp_tensor import _UnshardedFSDPTensor
 from .tensor import (
@@ -96,7 +220,7 @@ class _Float8GroupedMMFunction(torch.autograd.Function):
             output_dtype=weight_qdata_fprop_EIO.dtype,
             round_scales_to_power_of_2=True,
         )
-        output_RO = torch._scaled_grouped_mm(
+        output_RO = _fp8_scaled_grouped_mm(
             A_qdata_RI,
             weight_qdata_fprop_EIO,
             A_scale_R1.squeeze(-1).reciprocal(),
@@ -147,7 +271,7 @@ class _Float8GroupedMMFunction(torch.autograd.Function):
             output_dtype=weight_qdata_dgrad_EOI.dtype,
             round_scales_to_power_of_2=True,
         )
-        grad_A_RI = torch._scaled_grouped_mm(
+        grad_A_RI = _fp8_scaled_grouped_mm(
             grad_output_qdata_RO,
             weight_qdata_dgrad_EOI,
             grad_output_scale_R1.squeeze(-1).reciprocal(),
@@ -169,7 +293,7 @@ class _Float8GroupedMMFunction(torch.autograd.Function):
             weight_qdata_dgrad_EOI.dtype,
             round_scales_to_power_of_2=True,
         )
-        grad_weight_EOI = torch._scaled_grouped_mm(
+        grad_weight_EOI = _fp8_scaled_grouped_mm(
             grad_output_qdata_col.t(),
             A_qdata_col,
             grad_output_scale_col.t().reciprocal(),

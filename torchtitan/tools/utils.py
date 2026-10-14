@@ -47,12 +47,21 @@ def get_cuda_flash_attention_impl() -> str | None:
     if torch.version.hip is not None:
         return None
 
+    if not torch.cuda.is_available():
+        return None
+
     # FA4 advertises Hopper support, but as of writing it hangs under
     # torch.compile there, so Hopper (sm90) stays on FA3.
     # https://github.com/pytorch/torchtitan/pull/4413
-    if has_cuda_capability(10, 0):
+    # SM100/SM110 use FA4. SM120 (consumer Blackwell) has no tcgen05, and the
+    # PyTorch FA4 wrapper only accepts compute capability 9.0 and 10.0, so
+    # varlen stays on the built-in kernel there.
+    major = torch.cuda.get_device_capability()[0]
+    if major >= 12:
+        return None
+    if major >= 10:
         return "FA4"
-    if has_cuda_capability(9, 0):
+    if major >= 9:
         return "FA3"
     return None
 
