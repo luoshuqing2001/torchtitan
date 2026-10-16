@@ -27,6 +27,21 @@ from torchtitan.tools.utils import Color, device_module, device_type, NoColor
 logger = logging.getLogger(__name__)
 
 
+def _format_eta(seconds: float) -> str:
+    """Format a remaining-time estimate as ``5h 08m`` or ``12m 04s``."""
+    remaining = max(0, int(round(seconds)))
+    days, rest = divmod(remaining, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
 DeviceMemStats = namedtuple(
     "DeviceMemStats",
     [
@@ -346,6 +361,10 @@ class MetricsProcessor(Configurable):
     step_last_log: int | None
 
     num_flops_per_token: int
+    total_steps: int | None
+    eta_started: bool
+    eta_steps: int
+    eta_seconds: float
     has_quantization: bool
     optimizers: OptimizersContainer | None
     model_parts: list[torch.nn.Module] | None
@@ -393,6 +412,11 @@ class MetricsProcessor(Configurable):
 
         # These variables have to be set later as they depend on other components or model.
         self.num_flops_per_token = -1
+        self.total_steps = None
+        # The first log interval includes process startup, so ETA starts after it.
+        self.eta_started = False
+        self.eta_steps = 0
+        self.eta_seconds = 0.0
         self.optimizers = None
         self.model_parts = None
 
@@ -550,6 +574,26 @@ class MetricsProcessor(Configurable):
         if mfu is not None:
             metrics["mfu(%)"] = mfu
 
+        if self.total_steps:
+            progress = 100.0 * step / self.total_steps
+            metrics["progress(%)"] = progress
+            if self.eta_started and step > self.step_last_log:
+                self.eta_steps += step - self.step_last_log
+                self.eta_seconds += time_delta
+            self.eta_started = True
+            remaining_steps = self.total_steps - step
+            if self.eta_steps > 0 and remaining_steps > 0:
+                eta_seconds = remaining_steps * self.eta_seconds / self.eta_steps
+                metrics["eta(s)"] = eta_seconds
+                step_str = (
+                    f"step: {step}/{self.total_steps} "
+                    f"({progress:.2f}%, ETA {_format_eta(eta_seconds)})"
+                )
+            else:
+                step_str = f"step: {step}/{self.total_steps} ({progress:.2f}%)"
+        else:
+            step_str = f"step: {step:2}"
+
         if extra_metrics:
             metrics.update(extra_metrics)
 
@@ -558,7 +602,7 @@ class MetricsProcessor(Configurable):
         color = self.color
         mfu_str = f"{mfu:.2f}%" if mfu is not None else "N/A"
         logger.info(
-            f"{color.red}step: {step:2}  "
+            f"{color.red}{step_str}  "
             f"{color.green}loss: {global_avg_loss:8.5f}  "
             f"{color.orange}grad_norm: {grad_norm:7.4f}  "
             f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"

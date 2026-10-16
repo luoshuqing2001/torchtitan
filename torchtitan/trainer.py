@@ -194,6 +194,7 @@ class Trainer(Configurable):
             config_dict=config.to_dict(),
             has_quantization=engine.has_quantization,
         )
+        self.metrics_processor.total_steps = config.training.steps
         color = self.metrics_processor.color
 
         self.num_pp_microbatches = (

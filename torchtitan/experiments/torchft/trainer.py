@@ -213,6 +213,7 @@ class FaultTolerantTrainer(Configurable):
             ft_replica_id=config.fault_tolerance.replica_id,
             config_dict=config.to_dict(),
         )
+        self.metrics_processor.total_steps = config.training.steps
         color = self.metrics_processor.color
 
         self.num_pp_microbatches = num_pp_microbatches
