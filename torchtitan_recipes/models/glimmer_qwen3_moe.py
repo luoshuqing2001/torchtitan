@@ -9,14 +9,14 @@
 import os
 
 from torchtitan.components.checkpointer import CheckpointManager
-from torchtitan.components.data import (
-    ConcatThenSplitPackingConfig,
-    GrainDataLoader,
-    HuggingFaceStreamingSource,
-    SingleDatasetConfig,
-)
+from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.optim import Optim
+from torchtitan_recipes.models.climbmix import (
+    climbmix_dataset,
+    climbmix_train_and_val_files,
+    climbmix_validator,
+)
 from torchtitan_recipes.models.glimmer_muon import (
     glimmer_muon_optimizer,
     glimmer_wsd_scheduler,
@@ -32,7 +32,6 @@ from torchtitan.config.transform import (
 from torchtitan.models.common.token_dispatcher import DeepEPTokenDispatcher
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.local_compile import LocalCompileConfig
-from torchtitan.hf_datasets.text_datasets import TextProcessor
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.glimmer_qwen3_moe import (
     build_model_config,
@@ -110,17 +109,8 @@ def glimmer_qwen3_moe(seq_len: int | None = None) -> Trainer.Config:
         # removes an all-gather from every layer.
         fsdp_reshard_after_forward="never",
     )
-    dataset = SingleDatasetConfig(
-        source=HuggingFaceStreamingSource.Config(
-            path="parquet",
-            split="train",
-            load_dataset_kwargs={
-                "data_files": {"train": f"{data_dir}/shard_*.parquet"},
-            },
-        ),
-        processor=TextProcessor.Config(),
-        post_filters=(lambda sample: sample is not None,),
-    )
+    train_files, val_files = climbmix_train_and_val_files(data_dir)
+    dataset = climbmix_dataset(train_files)
     config = Trainer.Config(
         dump_folder=os.environ.get(
             "DUMP_FOLDER", "./outputs/glimmer_qwen3_moe_muon_wsd"
@@ -159,6 +149,10 @@ def glimmer_qwen3_moe(seq_len: int | None = None) -> Trainer.Config:
             disable_cuda_graphs=True,
         ),
         parallelism=parallelism,
+        validator=climbmix_validator(
+            val_files,
+            global_tokens_per_step=global_tokens_per_step,
+        ),
         checkpointer=CheckpointManager.Config(interval=200),
         activation_checkpoint=SelectiveAC.Config(),
         compile=LocalCompileConfig(),

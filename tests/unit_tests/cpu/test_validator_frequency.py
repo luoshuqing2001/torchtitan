@@ -41,6 +41,16 @@ class TestValidatorFrequency(unittest.TestCase):
         self.assertTrue(validator.should_validate(3))
         self.assertFalse(validator.should_validate(4))
 
+    def test_should_skip_step_one_when_disabled(self):
+        validator = BaseValidator(
+            config=BaseValidator.Config(freq=3, validate_on_step_one=False)
+        )
+
+        self.assertFalse(validator.should_validate(1))
+        self.assertFalse(validator.should_validate(2))
+        self.assertTrue(validator.should_validate(3))
+        self.assertTrue(validator.should_validate(6))
+
 
 if __name__ == "__main__":
     unittest.main()

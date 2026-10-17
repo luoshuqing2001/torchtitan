@@ -14,14 +14,14 @@ do not share a folder with the MoE run.
 import os
 
 from torchtitan.components.checkpointer import CheckpointManager
-from torchtitan.components.data import (
-    ConcatThenSplitPackingConfig,
-    GrainDataLoader,
-    HuggingFaceStreamingSource,
-    SingleDatasetConfig,
-)
+from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.optim import Optim
+from torchtitan_recipes.models.climbmix import (
+    climbmix_dataset,
+    climbmix_train_and_val_files,
+    climbmix_validator,
+)
 from torchtitan_recipes.models.glimmer_muon import (
     glimmer_muon_optimizer,
     glimmer_wsd_scheduler,
@@ -31,7 +31,6 @@ from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config.transform import Float8LinearConverter
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.local_compile import LocalCompileConfig
-from torchtitan.hf_datasets.text_datasets import TextProcessor
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.models.glimmer_dense import build_model_config
 from torchtitan.observability.metrics import MetricsProcessor
@@ -103,17 +102,8 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
     else:
         token_budget = int(os.environ.get("TOKEN_BUDGET", "10000000000"))
         steps = (token_budget + global_tokens_per_step - 1) // global_tokens_per_step
-    dataset = SingleDatasetConfig(
-        source=HuggingFaceStreamingSource.Config(
-            path="parquet",
-            split="train",
-            load_dataset_kwargs={
-                "data_files": {"train": f"{data_dir}/shard_*.parquet"},
-            },
-        ),
-        processor=TextProcessor.Config(),
-        post_filters=(lambda sample: sample is not None,),
-    )
+    train_files, val_files = climbmix_train_and_val_files(data_dir)
+    dataset = climbmix_dataset(train_files)
     parallelism = ParallelismConfig(
         expert_parallel_degree=1,
         tensor_parallel_degree=1,
@@ -156,6 +146,10 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
             # Varlen metadata is data-dependent unless max_num_documents is
             # fixed, so CUDA graphs stay off.
             disable_cuda_graphs=True,
+        ),
+        validator=climbmix_validator(
+            val_files,
+            global_tokens_per_step=global_tokens_per_step,
         ),
         checkpointer=CheckpointManager.Config(interval=200),
         activation_checkpoint=SelectiveAC.Config(),

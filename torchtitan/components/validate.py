@@ -31,6 +31,9 @@ class BaseValidator(Configurable):
         freq: int = 10
         """Frequency of validation"""
 
+        validate_on_step_one: bool = True
+        """Also validate after the first training step."""
+
         def __post_init__(self) -> None:
             if self.freq <= 0:
                 raise ValueError(
@@ -48,7 +51,9 @@ class BaseValidator(Configurable):
         raise NotImplementedError("validate method not implemented")
 
     def should_validate(self, step: int) -> bool:
-        return step == 1 or step % self.config.freq == 0
+        if step == 1 and self.config.validate_on_step_one:
+            return True
+        return step > 0 and step % self.config.freq == 0
 
 
 class Validator(BaseValidator):
