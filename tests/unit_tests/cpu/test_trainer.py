@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+
 from torchtitan.components.data.types import (
     TokenizedTrainingMicrobatch,
     TrainingMicrobatch,
@@ -90,6 +91,7 @@ def _training_loop(trainer: TrainingEngine) -> SimpleNamespace:
         gradient_accumulation_steps=trainer.gradient_accumulation_steps,
         num_pp_microbatches=trainer.num_pp_microbatches,
         metrics_processor=trainer.metrics_processor,
+        _record_trained_vocab=MagicMock(),
     )
 
 
@@ -132,6 +134,9 @@ def test_pp_forward_backward_microbatch_group_returns_sentinel_without_last_stag
         TrainingEngine,
         SimpleNamespace(
             pp_has_last_stage=False,
+            _sync_device=lambda: None,
+            _fwd_seconds=0.0,
+            _bwd_seconds=0.0,
             pp_schedule=SimpleNamespace(step=lambda **kwargs: None),
             parallelism_context=SimpleNamespace(
                 activate_spmd=lambda **kwargs: contextlib.nullcontext(),
@@ -178,6 +183,9 @@ def test_pp_forward_backward_microbatch_group_releases_consumed_loss_graphs(
         TrainingEngine,
         SimpleNamespace(
             pp_has_last_stage=True,
+            _sync_device=lambda: None,
+            _fwd_seconds=0.0,
+            _bwd_seconds=0.0,
             pp_schedule=SimpleNamespace(step=schedule_step),
             parallelism_context=SimpleNamespace(
                 activate_spmd=lambda **kwargs: contextlib.nullcontext(),
@@ -349,6 +357,8 @@ def test_forward_backward_runs_whole_accumulation(monkeypatch) -> None:
         return engine.loss_metrics["loss/mean"]
 
     engine = object.__new__(TrainingEngine)
+    engine._fwd_seconds = 0.0
+    engine._bwd_seconds = 0.0
     engine.model_parts = [_FakeModel()]
     engine.max_num_documents = 4
     engine.parallelism_context = SimpleNamespace(
@@ -611,7 +621,7 @@ def test_optim_update_clips_before_parameter_update() -> None:
     optim = cast(
         Optim,
         SimpleNamespace(
-            config=SimpleNamespace(max_norm=1.0),
+            config=Optim.Config(max_norm=1.0),
             parallelism_context=SimpleNamespace(
                 pp_enabled=False,
                 ep_enabled=False,
@@ -708,6 +718,8 @@ def test_trainer_accumulates_reused_cuda_graph_losses():
         return ForwardBackwardResult(graph_loss, [])
 
     metrics_processor = SimpleNamespace(
+        add_section_time=MagicMock(),
+        sync_trained_vocab=MagicMock(return_value={}),
         should_log=MagicMock(return_value=True),
         log=MagicMock(),
     )
@@ -736,6 +748,7 @@ def test_trainer_accumulates_reused_cuda_graph_losses():
             num_pp_microbatches=1,
             device=torch.device("cpu"),
             forward_backward=forward_backward,
+            take_fwd_bwd_seconds=lambda: (0.0, 0.0),
             loss=graph_loss,
             sdc_replayer=None,
             model_parts=[],
@@ -747,15 +760,11 @@ def test_trainer_accumulates_reused_cuda_graph_losses():
     )
     data_iterator = iter([_batch() for _ in range(3)])
 
-    Trainer.train_step(_training_loop(trainer), data_iterator)
+    loop = _training_loop(trainer)
+    Trainer.train_step(loop, data_iterator)
 
-    metrics_processor.log.assert_called_once_with(
-        1,
-        6.0,
-        6.0,
-        4.0,
-        extra_metrics={"n_tokens_seen": 3},
-    )
+    assert loop._pending_log == (1, 6.0, 6.0, 4.0, {"n_tokens_seen": 3})
+    metrics_processor.log.assert_not_called()
     assert trainer.num_completed_steps == 1
 
     metrics_processor.should_log.return_value = False
@@ -777,6 +786,8 @@ def test_engine_replay_checks_whole_accumulation() -> None:
         run_fwd_bwd=MagicMock(side_effect=lambda fn, **kwargs: fn()),
     )
     engine = object.__new__(TrainingEngine)
+    engine._fwd_seconds = 0.0
+    engine._bwd_seconds = 0.0
     engine.config = SimpleNamespace(
         training=SimpleNamespace(disable_cuda_graphs=True),
         parallelism=SimpleNamespace(
@@ -816,6 +827,8 @@ def test_replay_failure_propagates_from_engine():
         signature_mismatch="loss",
     )
     engine = object.__new__(TrainingEngine)
+    engine._fwd_seconds = 0.0
+    engine._bwd_seconds = 0.0
     engine.config = SimpleNamespace(
         training=SimpleNamespace(disable_cuda_graphs=True),
         parallelism=SimpleNamespace(

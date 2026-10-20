@@ -221,6 +221,7 @@ class Trainer(Configurable):
         )
 
         self.tokenizer = config.tokenizer.build(tokenizer_path=config.hf_assets_path)
+        self.metrics_processor.set_vocab_size(self.tokenizer.get_vocab_size())
         num_tokens_per_microbatch = (
             config.training.num_tokens_per_microbatch_per_dp_rank
         )
@@ -326,6 +327,16 @@ class Trainer(Configurable):
             # Tensors stay on CPU; moved to GPU per-microbatch during training
             yield microbatch
 
+    def _record_trained_vocab(self, microbatch: TrainingMicrobatch) -> None:
+        """Count tokenizer ids whose embedding row this batch updates."""
+        tokens = getattr(microbatch, "input", None)
+        if isinstance(tokens, torch.Tensor):
+            padding_mask = getattr(microbatch, "padding_mask", None)
+            if isinstance(padding_mask, torch.Tensor):
+                tokens = tokens[~padding_mask.to(dtype=torch.bool)]
+            self.metrics_processor.record_trained_tokens(tokens)
+        self.metrics_processor.record_trained_tokens(microbatch.labels)
+
     def train_step(self, data_iterator: Iterator[TrainingMicrobatch]):
         engine = self.engine
         current_step = engine.num_completed_steps + 1
@@ -338,6 +349,7 @@ class Trainer(Configurable):
         # complete PP step, or one local forward/backward when PP is disabled.
         microbatch_groups: list[list[TrainingMicrobatch]] = []
         local_valid_tokens = 0
+        data_start = time.perf_counter()
         for _ in range(self.gradient_accumulation_steps):
             microbatch_group = []
             for _ in range(self.num_pp_microbatches):
@@ -346,10 +358,17 @@ class Trainer(Configurable):
                 local_valid_tokens += microbatch.num_valid_tokens
                 microbatch_group.append(microbatch)
             microbatch_groups.append(microbatch_group)
+        self.metrics_processor.add_section_time(
+            "data", time.perf_counter() - data_start
+        )
+        for microbatch_group in microbatch_groups:
+            for microbatch in microbatch_group:
+                self._record_trained_vocab(microbatch)
         sl.log_trace_scalar({"local_valid_tokens": local_valid_tokens})
 
         # Keep the global token count on device so loss normalization does not
         # introduce a CPU synchronization in the training path.
+        token_count_start = time.perf_counter()
         local_valid_tokens_tensor = torch.tensor(
             local_valid_tokens,
             dtype=torch.int64,
@@ -362,16 +381,24 @@ class Trainer(Configurable):
             )
         else:
             global_valid_tokens = local_valid_tokens_tensor
+        token_count_seconds = time.perf_counter() - token_count_start
 
         forward_backward_result = engine.forward_backward(
             microbatch_groups=microbatch_groups,
             global_valid_tokens=global_valid_tokens,
         )
+        fwd_seconds, bwd_seconds = engine.take_fwd_bwd_seconds()
+        self.metrics_processor.add_section_time("fwd", token_count_seconds + fwd_seconds)
+        self.metrics_processor.add_section_time("bwd", bwd_seconds)
 
         # Capture the learning rates used by this optimizer update before the
         # scheduler advances in engine.optim_step().
         lr_metrics = engine.optim.lr_schedulers.get_metrics() if should_log else {}
+        optim_start = time.perf_counter()
         grad_norm = engine.optim_step()
+        self.metrics_processor.add_section_time(
+            "optim", time.perf_counter() - optim_start
+        )
 
         # log metrics
         if not should_log:
@@ -417,13 +444,15 @@ class Trainer(Configurable):
             "n_tokens_seen": global_ntokens_seen,
             **lr_metrics,
             **collect_aux_loss_metrics(parallelism_context),
+            **(self.metrics_processor.sync_trained_vocab() or {}),
         }
-        self.metrics_processor.log(
+        # Printed after checkpoint and validation so step_ms includes both.
+        self._pending_log = (
             engine.num_completed_steps,
             global_avg_loss,
             global_max_loss,
             float(grad_norm.item()),
-            extra_metrics=extra_metrics,
+            extra_metrics,
         )
 
     @record
@@ -440,6 +469,7 @@ class Trainer(Configurable):
         loaded_step = engine.num_completed_steps
 
         logger.info(f"Training starts at step {engine.num_completed_steps + 1}")
+        self._pending_log = None
 
         engine.start_profiler()
         try:
@@ -455,8 +485,12 @@ class Trainer(Configurable):
                         logger.warning("Ran out of data; last step was canceled.")
                         break
 
+                    ckpt_start = time.perf_counter()
                     engine.save_checkpoint(
                         last_step=(engine.num_completed_steps == config.training.steps)
+                    )
+                    self.metrics_processor.add_section_time(
+                        "ckpt", time.perf_counter() - ckpt_start
                     )
 
                     # Run validation if validator is available
@@ -464,8 +498,24 @@ class Trainer(Configurable):
                         self.config.validator is not None
                         and self.validator.should_validate(engine.num_completed_steps)
                     ):
+                        val_start = time.perf_counter()
                         self.validator.validate(
                             engine.model_parts, engine.num_completed_steps
+                        )
+                        self.metrics_processor.add_section_time(
+                            "val", time.perf_counter() - val_start
+                        )
+
+                    pending_log = getattr(self, "_pending_log", None)
+                    if pending_log is not None:
+                        step, avg_loss, max_loss, grad_norm, extra_metrics = pending_log
+                        self._pending_log = None
+                        self.metrics_processor.log(
+                            step,
+                            avg_loss,
+                            max_loss,
+                            grad_norm,
+                            extra_metrics=extra_metrics,
                         )
 
                     engine.step_profiler()

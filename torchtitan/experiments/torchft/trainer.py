@@ -344,6 +344,7 @@ class FaultTolerantTrainer(Configurable):
         # complete PP step, or one local forward/backward when PP is disabled.
         microbatch_groups: list[list[TrainingMicrobatch]] = []
         local_valid_tokens = 0
+        data_start = time.perf_counter()
         for _ in range(self.gradient_accumulation_steps):
             microbatch_group = []
             for _ in range(self.num_pp_microbatches):
@@ -351,6 +352,9 @@ class FaultTolerantTrainer(Configurable):
                 local_valid_tokens += microbatch.num_valid_tokens
                 microbatch_group.append(microbatch)
             microbatch_groups.append(microbatch_group)
+        self.metrics_processor.add_section_time(
+            "data", time.perf_counter() - data_start
+        )
 
         # Keep the global token count on device so loss normalization does not
         # introduce a CPU synchronization in the training path.
@@ -369,8 +373,15 @@ class FaultTolerantTrainer(Configurable):
             microbatch_groups=microbatch_groups,
             global_valid_tokens=global_valid_tokens,
         )
+        fwd_seconds, bwd_seconds = engine.take_fwd_bwd_seconds()
+        self.metrics_processor.add_section_time("fwd", fwd_seconds)
+        self.metrics_processor.add_section_time("bwd", bwd_seconds)
 
+        optim_start = time.perf_counter()
         grad_norm = engine.optim_step()
+        self.metrics_processor.add_section_time(
+            "optim", time.perf_counter() - optim_start
+        )
 
         # log metrics
         if not should_log:
@@ -469,8 +480,12 @@ class FaultTolerantTrainer(Configurable):
                     logger.warning("Ran out of data; last step was canceled.")
                     break
 
+                ckpt_start = time.perf_counter()
                 engine.save_checkpoint(
                     last_step=(engine.num_completed_steps == config.training.steps),
+                )
+                self.metrics_processor.add_section_time(
+                    "ckpt", time.perf_counter() - ckpt_start
                 )
 
                 # Run validation if validator is available
@@ -478,8 +493,12 @@ class FaultTolerantTrainer(Configurable):
                     self.config.validator is not None
                     and self.validator.should_validate(engine.num_completed_steps)
                 ):
+                    val_start = time.perf_counter()
                     self.validator.validate(
                         engine.model_parts, engine.num_completed_steps
+                    )
+                    self.metrics_processor.add_section_time(
+                        "val", time.perf_counter() - val_start
                     )
 
                 # signal the profiler that the next profiling step has started

@@ -12,8 +12,8 @@ from dataclasses import dataclass, field
 from typing import cast
 
 import torch
-import torch.nn as nn
 import torch_remat as remat
+from torch import nn
 from torch._functorch.partitioners import get_default_op_list
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
@@ -25,7 +25,6 @@ from torch.utils.checkpoint import (
 
 from torchtitan.config import Configurable
 from torchtitan.protocols.module import Module
-
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +203,8 @@ class SelectiveAC(ActivationCheckpointing):
 
     @dataclass(kw_only=True, slots=True)
     class Config(ActivationCheckpointing.Config):
+        recompute_linear: bool = False
+        """Recompute all plain mm/linear ops; scaled FP8 matmuls keep their policy."""
         force_recompute_mm_shapes_by_fqns: list[str] = field(
             default_factory=lambda: ["moe.router.gate"]
         )
@@ -278,7 +279,7 @@ class SelectiveAC(ActivationCheckpointing):
                     # linear weight is (out, in); normalize to (in, out) to match mm
                     if func == torch.ops.aten.linear.default:
                         weight_shape = torch.Size((weight_shape[1], weight_shape[0]))
-                    if weight_shape in mm_recompute_shapes:
+                    if config.recompute_linear or weight_shape in mm_recompute_shapes:
                         return CheckpointPolicy.PREFER_RECOMPUTE
                     meta[mm_count_key] += 1
 

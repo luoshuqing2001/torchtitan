@@ -19,7 +19,7 @@ from typing import Any, cast, Literal, TYPE_CHECKING
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint import HuggingFaceStorageWriter
+from torch.distributed.checkpoint import DefaultLoadPlanner, HuggingFaceStorageWriter
 from torch.distributed.checkpoint._consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
 )
@@ -87,6 +87,75 @@ class _FilesystemCheckpointStorage:
 
     def remove(self, path: str) -> None:
         filesystem.rmtree(path)
+
+
+def _graft_saved_subtrees(
+    node: Any, prefix: str, metadata_keys: set[str]
+) -> list[str]:
+    """Replace empty leaves with the nested object stored in a checkpoint.
+
+    A fresh Hugging Face iterator keeps ``previous_state`` as ``None`` until
+    the first read. After training, that field is a dict, and DCP saves each
+    child under its own key. Loading the fresh ``None`` key then fails because
+    the checkpoint has ``previous_state.shard_idx`` instead.
+    """
+    if not isinstance(node, dict):
+        return []
+    grafted: list[str] = []
+    for key, value in list(node.items()):
+        path = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict):
+            grafted.extend(_graft_saved_subtrees(value, path, metadata_keys))
+            continue
+        if value is not None:
+            continue
+        child_prefix = path + "."
+        children = [
+            saved[len(child_prefix) :]
+            for saved in metadata_keys
+            if saved.startswith(child_prefix)
+        ]
+        if not children:
+            continue
+        tree: dict[str, Any] = {}
+        for relative in children:
+            cursor = tree
+            parts = relative.split(".")
+            for part in parts[:-1]:
+                nxt = cursor.setdefault(part, {})
+                if not isinstance(nxt, dict):
+                    cursor = None
+                    break
+                cursor = nxt
+            if isinstance(cursor, dict):
+                cursor.setdefault(parts[-1], None)
+        node[key] = tree
+        grafted.append(path)
+    return grafted
+
+
+class _ResumeLoadPlanner(DefaultLoadPlanner):
+    """Load a checkpoint whose dataloader cursor is nested more deeply."""
+
+    def set_up_planner(
+        self,
+        state_dict: dict[str, Any],
+        metadata: Any | None = None,
+        is_coordinator: bool = False,
+    ) -> None:
+        if metadata is not None:
+            dataloader = state_dict.get(DATALOADER)
+            grafted = _graft_saved_subtrees(
+                dataloader,
+                DATALOADER,
+                set(metadata.state_dict_metadata),
+            )
+            if grafted and is_coordinator:
+                logger.info(
+                    "Adopting nested checkpoint state for %s",
+                    ", ".join(grafted),
+                )
+        super().set_up_planner(state_dict, metadata, is_coordinator)
 
 
 class CheckpointManager(BaseCheckpointManager):
@@ -400,7 +469,11 @@ class CheckpointManager(BaseCheckpointManager):
             state_dict = self.sd_adapter.from_hf(hf_state_dict)
             states[MODEL].load_state_dict(state_dict)
         else:
-            dcp.load(state_dict, checkpoint_id=checkpoint_id)
+            dcp.load(
+                state_dict,
+                checkpoint_id=checkpoint_id,
+                planner=_ResumeLoadPlanner(),
+            )
 
             # TODO: Since we flatten the model states in state_dict, we need to
             # manually call load_state_dict() for the model. Need to fix this.

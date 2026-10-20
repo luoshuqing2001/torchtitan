@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
@@ -212,6 +213,8 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         self.num_accumulation_steps = 1
         self.num_completed_steps = 0
         self.ntokens_seen = 0
+        self._fwd_seconds = 0.0
+        self._bwd_seconds = 0.0
         self.sdc_replayer = None
         self.preprocess_inputs_kwargs: dict[str, Any] = {}
         self.loss_metrics = {}
@@ -470,6 +473,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             raise ValueError("microbatch_groups must not be empty.")
         self.num_accumulation_steps = len(microbatch_groups)
         self.gc_handler.run(self.num_completed_steps + 1)
+        prep_start = time.perf_counter()
         self.optim.zero_grad(set_to_none=True)
         if isinstance(global_valid_tokens, int):
             global_valid_tokens = torch.tensor(
@@ -484,6 +488,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         preprocessed_microbatch_groups = self._preprocess_microbatch_groups(
             microbatch_groups
         )
+        self._fwd_seconds += time.perf_counter() - prep_start
 
         if self.sdc_replayer is not None:
             result = self.sdc_replayer.run_fwd_bwd(
@@ -503,6 +508,17 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
 
         self.loss = result.loss
         return result
+
+    def take_fwd_bwd_seconds(self) -> tuple[float, float]:
+        """Return forward and backward time accumulated since the last take."""
+        fwd, bwd = self._fwd_seconds, self._bwd_seconds
+        self._fwd_seconds = 0.0
+        self._bwd_seconds = 0.0
+        return fwd, bwd
+
+    def _sync_device(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
 
     def _preprocess_microbatch_groups(
         self,
@@ -643,6 +659,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         with self.parallelism_context.activate_spmd(
             typechecking=self.config.debug.spmd_typechecking,
         ):
+            fwd_start = time.perf_counter()
             pred = self.model_parts[0](inputs, **model_kwargs)
             loss, self.loss_metrics = self.loss_fn(
                 pred,
@@ -650,8 +667,13 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 **loss_kwargs,
             )
             del pred
+            self._sync_device()
+            self._fwd_seconds += time.perf_counter() - fwd_start
+            bwd_start = time.perf_counter()
             with spmd.no_typecheck():
                 loss.backward()
+            self._sync_device()
+            self._bwd_seconds += time.perf_counter() - bwd_start
         return loss
 
     def _pp_forward_backward_microbatch_group(
@@ -672,6 +694,8 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             typechecking=self.config.debug.spmd_typechecking,
         ):
             losses = [] if self.pp_has_last_stage else None
+            # The pipeline schedule runs forward and backward as one call.
+            fwd_start = time.perf_counter()
             self.pp_schedule.step(
                 arg_mbs=inputs,
                 kwarg_mbs=model_kwargs,
@@ -681,6 +705,8 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 return_outputs=False,
                 finalize_gradients=finalize_gradients,
             )
+            self._sync_device()
+            self._fwd_seconds += time.perf_counter() - fwd_start
 
         if self.pp_has_last_stage:
             assert losses is not None

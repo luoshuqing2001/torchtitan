@@ -11,12 +11,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-
 from torchao.float8.config import e4m3_dtype
 from torchao.float8.float8_utils import amax_to_scale, to_fp8_saturated
 
-from .._fsdp_tensor import _ShardedFSDPTensor
+from torchtitan.distributed.local_compile import local_compile
 
+from .._fsdp_tensor import _ShardedFSDPTensor
 
 __all__: list[str] = []
 
@@ -28,6 +28,7 @@ _FLOAT8_GEMM_ALIGNMENT = 16
 # so recording scale computation and casting would only retain temporary storage.
 # This follows torchao.float8.float8_scaling_utils.hp_tensor_to_float8_dynamic,
 # but returns its plain qdata and scale for TorchTitan's FSDP-owned cache.
+@local_compile("float8_quantize", batch_invariant=False, dynamic=True)
 @torch.no_grad()
 def _quantize_float8(
     tensor: torch.Tensor,
@@ -238,3 +239,14 @@ class _GroupedLinearShardedTensorWithFloat8Compute(_ShardedFSDPTensor):
         out.weight_qdata_dgrad_EOI.copy_(operands.weight_qdata_dgrad_EOI)
         out.weight_scale_dgrad_EI.copy_(operands.weight_scale_dgrad_EI)
         return out
+
+
+# Checkpoint load uses weights_only=True. These tensor subclasses are the
+# parameters DCP stored, so they have to be allowlisted before unpickling.
+torch.serialization.add_safe_globals(
+    [
+        _LinearShardedTensorWithFloat8Compute,
+        _LinearShardedTensorWithFloat8HighPrecisionWeightGradient,
+        _GroupedLinearShardedTensorWithFloat8Compute,
+    ]
+)

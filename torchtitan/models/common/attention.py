@@ -13,6 +13,7 @@
 #   K = query/key head dimension, V = value head dimension.
 
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, NamedTuple
 
@@ -21,22 +22,24 @@ import torch
 import torch.nn.functional as F
 import torch_remat as remat
 from torch.nn.attention import (
+    SDPBackend,
     activate_flash_attention_impl,
     current_flash_attention_impl,
     sdpa_kernel,
-    SDPBackend,
 )
 from torch.nn.attention.flex_attention import (
     _DEFAULT_SPARSE_BLOCK_SIZE,
-    _mask_mod_signature,
-    _score_mod_signature,
     AuxRequest,
     BlockMask,
+    _mask_mod_signature,
+    _score_mod_signature,
     create_block_mask,
     flex_attention,
 )
 from torch.nn.attention.varlen import (
     AuxRequest as VarlenAuxRequest,
+)
+from torch.nn.attention.varlen import (
     varlen_attn as _varlen_attn,
 )
 
@@ -47,7 +50,6 @@ from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 from torchtitan.tools.utils import round_up
-
 
 __all__ = [
     "FlexInnerAttention",
@@ -146,6 +148,21 @@ class InnerAttention(Module):
         pass
 
 
+def _varlen_backend_context(device: torch.device):
+    if (
+        device.type == "cuda"
+        and torch.version.hip is None
+        and torch.are_deterministic_algorithms_enabled()
+    ):
+        # cuDNN varlen backward can vary even with both deterministic flags set.
+        if not torch.backends.cuda.flash_sdp_enabled():
+            raise RuntimeError(
+                "Deterministic varlen attention requires an enabled FlashAttention backend"
+            )
+        return sdpa_kernel(SDPBackend.FLASH_ATTENTION)
+    return nullcontext()
+
+
 class VarlenInnerAttention(InnerAttention):
     @dataclass(kw_only=True, slots=True)
     class Config(InnerAttention.Config):
@@ -187,9 +204,9 @@ class VarlenInnerAttention(InnerAttention):
         ) = None,
         **kwargs,
     ) -> torch.Tensor:
-        assert isinstance(
-            attention_masks, VarlenMetadata
-        ), f"attention_masks must be instance of VarlenMetadata but got {type(attention_masks)}"
+        assert isinstance(attention_masks, VarlenMetadata), (
+            f"attention_masks must be instance of VarlenMetadata but got {type(attention_masks)}"
+        )
 
         cu_seq_q = attention_masks.cu_seq_q
         cu_seq_k = attention_masks.cu_seq_k
@@ -217,18 +234,19 @@ class VarlenInnerAttention(InnerAttention):
 
         varlen_attn_fn = varlen_attn if out_transform is None else varlen_attn_with_lse
 
-        result = varlen_attn_fn(
-            q_THK.to(torch.bfloat16),
-            k_THK.to(torch.bfloat16),
-            v_THV.to(torch.bfloat16),
-            cu_seq_q,
-            cu_seq_k,
-            max_q,
-            max_k,
-            scale=scale,
-            window_size=self.window_size,
-            **varlen_kwargs,
-        )
+        with _varlen_backend_context(q_THK.device):
+            result = varlen_attn_fn(
+                q_THK.to(torch.bfloat16),
+                k_THK.to(torch.bfloat16),
+                v_THV.to(torch.bfloat16),
+                cu_seq_q,
+                cu_seq_k,
+                max_q,
+                max_k,
+                scale=scale,
+                window_size=self.window_size,
+                **varlen_kwargs,
+            )
 
         # varlen_attn returns the packed output (T, H, V), plus the LSE when an
         # out_transform epilogue was requested.
@@ -296,7 +314,6 @@ class FlexInnerAttention(InnerAttention):
         per-head attention maxima across forwards. The base implementation is
         a no-op.
         """
-        pass
 
     @staticmethod
     def compiled_flex_attn(
@@ -362,9 +379,9 @@ class FlexInnerAttention(InnerAttention):
         ) = None,
         **kwargs,
     ) -> torch.Tensor:
-        assert isinstance(
-            attention_masks, BlockMask
-        ), f"attention_masks must be instance of BlockMask, got {type(attention_masks)}"
+        assert isinstance(attention_masks, BlockMask), (
+            f"attention_masks must be instance of BlockMask, got {type(attention_masks)}"
+        )
 
         q_1HTK = q_THK.transpose(0, 1).unsqueeze(0)
         k_1HTK = k_THK.transpose(0, 1).unsqueeze(0)
@@ -770,7 +787,9 @@ class QKVLinear(Module):
         # Use -1 for n_kv_heads so TP sharding is handled automatically.
         qkv = self.wqkv(x)
         num_tokens = qkv.shape[0]
-        with spmd.local():  # TODO(pianpwk): same QKV:S(1) unflatten case handled by even sharding
+        with (
+            spmd.local()
+        ):  # TODO(pianpwk): same QKV:S(1) unflatten case handled by even sharding
             qkv = qkv.view(num_tokens, -1, self.r_dim, self.head_dim)
             if spmd.is_type_checking():
                 spmd.assert_type(

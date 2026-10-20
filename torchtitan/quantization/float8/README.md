@@ -63,6 +63,13 @@ For scaling strategy, we support rowwise dynamic scaling (alpha).
 
 ### FSDP-managed weights
 
+Recipes using local compilation can opt into fused dynamic quantization with
+`config.compile.regions.append("float8_quantize")`. This compiles the scale
+reduction, scaling, saturation and Float8 cast as one function region, reducing
+temporary activation buffers and separate elementwise kernels. The region is
+disabled by default and does not support batch-invariant mode. Initial calls
+include compilation overhead; parameters and checkpoint layouts are unchanged.
+
 With FSDP, persistent dense and expert parameters and checkpoint state remain
 in high precision. After each all-gather, FSDP builds and owns separate Float8
 weight operands for FPROP and DGRAD, then releases the high-precision all-gather

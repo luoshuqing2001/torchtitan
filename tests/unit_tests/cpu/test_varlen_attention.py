@@ -13,18 +13,73 @@ from unittest.mock import patch
 
 import spmd_types as spmd
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import _per_axis_types
 from torchtitan.models.common.attention import (
-    create_varlen_metadata_for_document,
     GQAttention,
     QKVLinear,
     VarlenInnerAttention,
     VarlenMetadata,
+    _varlen_backend_context,
+    create_varlen_metadata_for_document,
 )
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.rope import ComplexRoPE
+
+
+class TestDeterministicVarlenBackend(unittest.TestCase):
+    def setUp(self):
+        self.previous = torch.are_deterministic_algorithms_enabled()
+
+    def tearDown(self):
+        torch.use_deterministic_algorithms(self.previous, warn_only=False)
+
+    def test_cuda_strict_mode_selects_flash_and_restores_flags(self):
+        torch.use_deterministic_algorithms(True)
+        with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION]):
+            with _varlen_backend_context(torch.device("cuda")):
+                self.assertTrue(torch.backends.cuda.flash_sdp_enabled())
+                self.assertFalse(torch.backends.cuda.cudnn_sdp_enabled())
+            self.assertTrue(torch.backends.cuda.flash_sdp_enabled())
+            self.assertTrue(torch.backends.cuda.cudnn_sdp_enabled())
+
+    def test_normal_mode_preserves_explicit_backend(self):
+        torch.use_deterministic_algorithms(False)
+        with (
+            sdpa_kernel(SDPBackend.CUDNN_ATTENTION),
+            _varlen_backend_context(torch.device("cuda")),
+        ):
+            self.assertFalse(torch.backends.cuda.flash_sdp_enabled())
+            self.assertTrue(torch.backends.cuda.cudnn_sdp_enabled())
+
+    def test_strict_mode_rejects_disabled_flash(self):
+        torch.use_deterministic_algorithms(True)
+        with (
+            sdpa_kernel(SDPBackend.CUDNN_ATTENTION),
+            self.assertRaisesRegex(RuntimeError, "requires an enabled FlashAttention"),
+        ):
+            _varlen_backend_context(torch.device("cuda"))
+
+    def test_non_cuda_keeps_backend_context(self):
+        torch.use_deterministic_algorithms(True)
+        with (
+            sdpa_kernel(SDPBackend.CUDNN_ATTENTION),
+            _varlen_backend_context(torch.device("cpu")),
+        ):
+            self.assertFalse(torch.backends.cuda.flash_sdp_enabled())
+            self.assertTrue(torch.backends.cuda.cudnn_sdp_enabled())
+
+    def test_rocm_keeps_backend_context(self):
+        torch.use_deterministic_algorithms(True)
+        with (
+            patch("torch.version.hip", "test"),
+            sdpa_kernel(SDPBackend.CUDNN_ATTENTION),
+            _varlen_backend_context(torch.device("cuda")),
+        ):
+            self.assertFalse(torch.backends.cuda.flash_sdp_enabled())
+            self.assertTrue(torch.backends.cuda.cudnn_sdp_enabled())
 
 
 class TestPackedVarlenMetadata(unittest.TestCase):

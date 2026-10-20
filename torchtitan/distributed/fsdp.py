@@ -37,6 +37,16 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
+def _ignored_params(module: nn.Module) -> set[nn.Parameter] | None:
+    """Collect parameters explicitly excluded by their owning model."""
+    params = {
+        parameter
+        for parameter in module.parameters()
+        if getattr(parameter, "_torchtitan_skip_fsdp", False)
+    }
+    return params or None
+
+
 if TYPE_CHECKING:
     from torchtitan.models.common.decoder import Decoder
     from torchtitan.models.common.moe import MoE
@@ -416,6 +426,7 @@ def apply_fsdp_to_decoder(
                     **fsdp_config,
                     reshard_after_forward=reshard_after_forward,
                     shard_placement_fn=_shard_placement_fn,
+                    ignored_params=_ignored_params(transformer_block),
                 )
         else:
             fully_shard(
@@ -423,9 +434,14 @@ def apply_fsdp_to_decoder(
                 **fsdp_config,
                 reshard_after_forward=reshard_after_forward,
                 shard_placement_fn=stacked_param_placements.get,
+                ignored_params=_ignored_params(transformer_block),
             )
 
-    fully_shard(model, **fsdp_config)
+    fully_shard(
+        model,
+        **fsdp_config,
+        ignored_params=_ignored_params(model),
+    )
 
     enable_fsdp_symm_mem(model, symm_mem_scope)
 

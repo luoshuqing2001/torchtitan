@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+
 from torchtitan.components.data.types import TokenizedTrainingMicrobatch
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.optim import Optim
@@ -24,6 +25,8 @@ class TestInvalidLoss(unittest.TestCase):
         # touches on the non-distributed (single-rank) path.
         loop = object.__new__(Trainer)
         trainer = object.__new__(TrainingEngine)
+        trainer._fwd_seconds = 0.0
+        trainer._bwd_seconds = 0.0
 
         trainer.checkpointer = MagicMock()
         trainer.model_parts = [
@@ -57,7 +60,7 @@ class TestInvalidLoss(unittest.TestCase):
         trainer.parallelism_context = parallelism_context
 
         optim = object.__new__(Optim)
-        optim.config = SimpleNamespace(max_norm=1.0)
+        optim.config = Optim.Config(max_norm=1.0)
         optim.parallelism_context = parallelism_context
         optim.pp_has_last_stage = True
         optim.parameters = []

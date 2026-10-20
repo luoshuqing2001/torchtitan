@@ -12,23 +12,24 @@ Every flavor uses the same block as the MoE run's attention side:
 - SwiGLU hidden size ``3 * dim`` (gate and up fused in ``w13``, down in ``w2``)
 - q/k RMSNorm, tuned query scale, sigmoid output gate
 - iRoPE with a 512/512/512/global sliding-window cycle
-- tied GPT-2 vocabulary (50304)
+- tied OLMo3 vocabulary, padded from 100278 tokenizer ids to 100352
 
 Depth is a multiple of 4 so the iRoPE / window cycle closes. Counts below
-include the tied embedding once.
+include the tied embedding once. The step names stay ``d200m`` through
+``d1b``; the smaller OLMo3 table is why the totals sit below the old
+Qwen3.8 counts. PLE and Engram at the same ``ple_dim`` match in both total
+and active parameters.
 
-- ``d200m``: dim 1024, 12 layers, 16/4 heads, FFN 3072. 209M.
-  Closest dense match to the MoE run's ~180M active parameters.
-- ``d400m``: dim 1280, 16 layers, 20/5 heads, FFN 3840. 392M.
-- ``d700m``: dim 1536, 20 layers, 24/6 heads, FFN 4608. 667M.
-- ``d1b``: dim 2048, 16 layers, 32/8 heads, FFN 6144. 942M.
-  20 layers at this width would be 1.15B, past the 1B cap, so this step
-  gets wider instead of deeper.
+- ``d200m``: dim 1024, 12 layers, 16/4 heads, FFN 3072. 260,097,024.
+- ``d400m``: dim 1280, 16 layers, 20/5 heads, FFN 3840. 456,213,760.
+- ``d700m``: dim 1536, 20 layers, 24/6 heads, FFN 4608. 744,089,088.
+- ``d1b``: dim 2048, 24 layers, 32/8 heads, FFN 6144. 1,464,010,752.
 """
 
 from collections.abc import Callable
 from functools import partial
 
+import torch
 import torch.nn as nn
 
 from torchtitan.config.transform import (
@@ -45,7 +46,9 @@ from torchtitan.models.muse_glimmer.flavors import (
 )
 from torchtitan.models.muse_glimmer.model import RMSGainCenterNorm
 
+from .engram import EngramTable, EngramUpdate, NGramEngram, rows_per_head_matching_ple
 from .model import GlimmerDenseBlock, GlimmerDenseModel
+from .ple import LayerPLE, PerLayerContext, PerLayerEmbedder, PLE_DIM_TIERS, _PLE_DIM
 
 __all__ = [
     "MODEL_FLAVORS",
@@ -55,7 +58,10 @@ __all__ = [
 
 
 _EMBEDDING_INIT = {"weight": partial(nn.init.normal_, std=0.02)}
-_VOCAB_SIZE = 50304
+# allenai/Olmo-3-1025-7B tokenizer has 100278 ids. The embedding and tied
+# LM head are padded to the next multiple of 256.
+_VOCAB_SIZE = 100352
+_EOS_TOKEN_ID = 100257
 _HEAD_DIM = 64
 _FFN_MULTIPLIER = 3
 _WINDOW_PATTERN = [512, 512, 512, 0]
@@ -68,7 +74,7 @@ _FLAVOR_SHAPES: dict[str, tuple[int, int]] = {
     "d200m": (1024, 12),
     "d400m": (1280, 16),
     "d700m": (1536, 20),
-    "d1b": (2048, 16),
+    "d1b": (2048, 24),
 }
 
 
@@ -86,12 +92,97 @@ def _output_norm(dim: int) -> RMSGainCenterNorm.Config:
     )
 
 
+def _layer_ple(dim: int, ple_dim: int) -> LayerPLE.Config:
+    return LayerPLE.Config(
+        dim=dim,
+        ple_dim=ple_dim,
+        param_init={
+            "gate_weight": partial(nn.init.normal_, std=0.02),
+            "proj_weight": partial(nn.init.normal_, std=0.02),
+            "norm_weight": nn.init.ones_,
+        },
+    )
+
+
+def _ple_config(dim: int, n_layers: int, ple_dim: int) -> PerLayerEmbedder.Config:
+    width = n_layers * ple_dim
+    return PerLayerEmbedder.Config(
+        vocab_size=_VOCAB_SIZE,
+        dim=dim,
+        num_layers=n_layers,
+        ple_dim=ple_dim,
+        table=Embedding.Config(
+            num_embeddings=_VOCAB_SIZE,
+            embedding_dim=width,
+            param_init=_EMBEDDING_INIT,
+        ),
+        context=PerLayerContext.Config(
+            dim=dim,
+            num_layers=n_layers,
+            ple_dim=ple_dim,
+            param_init={
+                "weight": partial(nn.init.normal_, std=0.02),
+                "norm_weight": nn.init.ones_,
+            },
+        ),
+    )
+
+
+def _init_engram_conv(tensor):
+    nn.init.zeros_(tensor)
+    with torch.no_grad():
+        tensor[0].fill_(1)
+    return tensor
+
+
+def _engram_config(dim: int, n_layers: int, ple_dim: int) -> NGramEngram.Config:
+    rows, remainder = rows_per_head_matching_ple(
+        dim,
+        n_layers,
+        vocab_size=_VOCAB_SIZE,
+        ple_dim=ple_dim,
+    )
+    table_init = {"weight": partial(nn.init.normal_, std=0.02)}
+    if remainder:
+        table_init["remainder_weight"] = nn.init.zeros_
+    return NGramEngram.Config(
+        dim=dim,
+        n_layers=n_layers,
+        ple_dim=ple_dim,
+        eos_token_id=_EOS_TOKEN_ID,
+        rows_per_head=rows,
+        remainder=remainder,
+        table=EngramTable.Config(
+            dim=dim,
+            rows_per_head=rows,
+            eos_token_id=_EOS_TOKEN_ID,
+            remainder=remainder,
+            param_init=table_init,
+        ),
+        update=EngramUpdate.Config(
+            dim=dim,
+            n_layers=n_layers,
+            ple_dim=ple_dim,
+            eos_token_id=_EOS_TOKEN_ID,
+            param_init={
+                "key_weight": nn.init.zeros_,
+                "value_up": partial(nn.init.normal_, std=0.02),
+                "value_down": nn.init.zeros_,
+                "value_scale": nn.init.ones_,
+                "conv_weight": _init_engram_conv,
+            },
+        ),
+    )
+
+
 def _flavor_config(
     dim: int,
     n_layers: int,
     attn_backend: str,
     *,
     seq_len: int,
+    memory: str = "none",
+    ple_dim: int = _PLE_DIM,
 ) -> GlimmerDenseModel.Config:
     n_heads = dim // _HEAD_DIM
     n_kv_heads = n_heads // 4
@@ -125,6 +216,7 @@ def _flavor_config(
                     w1_param_init=_LINEAR_INIT,
                     w2w3_param_init=_depth_init(layer_id),
                 ),
+                layer_ple=_layer_ple(dim, ple_dim) if memory == "ple" else None,
             )
         )
     return GlimmerDenseModel.Config(
@@ -145,6 +237,10 @@ def _flavor_config(
             param_init=output_init,
         ),
         layers=layers,
+        ple=_ple_config(dim, n_layers, ple_dim) if memory == "ple" else None,
+        engram=(
+            _engram_config(dim, n_layers, ple_dim) if memory == "engram" else None
+        ),
     )
 
 
@@ -159,6 +255,8 @@ def build_model_config(
     *,
     seq_len: int | None = None,
     attn_backend: str = "flex",
+    memory: str = "none",
+    ple_dim: int = _PLE_DIM,
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> GlimmerDenseModel.Config:
     dim, n_layers, max_context_len = MODEL_FLAVORS[flavor]
@@ -168,8 +266,21 @@ def build_model_config(
             f"Requested seq_len {context_len} exceeds max context length "
             f"{max_context_len} for flavor {flavor}"
         )
+    if memory not in ("none", "ple", "engram"):
+        raise ValueError(
+            f"memory must be 'none', 'ple', or 'engram', got {memory!r}"
+        )
+    if ple_dim not in PLE_DIM_TIERS:
+        raise ValueError(
+            f"ple_dim must be one of {PLE_DIM_TIERS}, got {ple_dim}"
+        )
     config = _flavor_config(
-        dim, n_layers, attn_backend, seq_len=context_len
+        dim,
+        n_layers,
+        attn_backend,
+        seq_len=context_len,
+        memory=memory,
+        ple_dim=ple_dim,
     )
     if converters is not None:
         validate_converter_compatibility(converters)

@@ -42,6 +42,35 @@ def _format_eta(seconds: float) -> str:
     return f"{secs}s"
 
 
+_LATENCY_SECTIONS = ("data", "fwd", "bwd", "optim", "ckpt", "val")
+
+
+def _latency_per_step(
+    *,
+    section_seconds: dict[str, float],
+    wall_seconds: float,
+    steps: int,
+) -> dict[str, float]:
+    """Average the timed sections over the steps in one log window."""
+    if steps <= 0:
+        raise ValueError(f"steps must be positive, got {steps}")
+    per_step = {name: section_seconds.get(name, 0.0) / steps for name in _LATENCY_SECTIONS}
+    measured = sum(per_step.values())
+    per_step["other"] = max(0.0, wall_seconds / steps - measured)
+    per_step["step"] = measured + per_step["other"]
+    return per_step
+
+
+def _format_latency(latency: dict[str, float]) -> str:
+    """One log fragment: total step time, then each timed section, in milliseconds."""
+
+    def _ms(seconds: float) -> str:
+        return f"{seconds * 1000:.0f}ms"
+
+    parts = " ".join(f"{name} {_ms(latency[name])}" for name in (*_LATENCY_SECTIONS, "other"))
+    return f"step_ms: {_ms(latency['step'])}  [{parts}]"
+
+
 DeviceMemStats = namedtuple(
     "DeviceMemStats",
     [
@@ -365,6 +394,8 @@ class MetricsProcessor(Configurable):
     eta_started: bool
     eta_steps: int
     eta_seconds: float
+    section_seconds: dict[str, float]
+    latency_window_start: float
     has_quantization: bool
     optimizers: OptimizersContainer | None
     model_parts: list[torch.nn.Module] | None
@@ -417,8 +448,58 @@ class MetricsProcessor(Configurable):
         self.eta_started = False
         self.eta_steps = 0
         self.eta_seconds = 0.0
+        self.section_seconds = {name: 0.0 for name in _LATENCY_SECTIONS}
+        self.latency_window_start = time.perf_counter()
         self.optimizers = None
         self.model_parts = None
+        self.vocab_size: int | None = None
+        self._trained_token_mask: torch.Tensor | None = None
+
+    def add_section_time(self, section: str, seconds: float) -> None:
+        """Accumulate one timed piece of the steps since the last log."""
+        self.section_seconds[section] += seconds
+
+    def set_vocab_size(self, vocab_size: int) -> None:
+        """Track which tokenizer ids have appeared in a training batch."""
+        if vocab_size <= 0:
+            raise ValueError(f"vocab_size must be positive, got {vocab_size}")
+        self.vocab_size = vocab_size
+        self._trained_token_mask = torch.zeros(vocab_size, dtype=torch.bool)
+
+    def record_trained_tokens(self, token_ids: torch.Tensor) -> None:
+        """Mark token ids that update a vocabulary row on this rank."""
+        mask = self._trained_token_mask
+        if mask is None or token_ids.numel() == 0:
+            return
+        ids = token_ids.detach().reshape(-1)
+        if ids.device.type != "cpu":
+            ids = ids.cpu()
+        ids = ids.to(dtype=torch.int64)
+        valid = (ids >= 0) & (ids < mask.numel())
+        if bool(valid.any()):
+            mask[ids[valid]] = True
+
+    def sync_trained_vocab(self) -> dict[str, float | int] | None:
+        """Return the global fraction of tokenizer ids seen by any rank."""
+        mask = self._trained_token_mask
+        if mask is None or self.vocab_size is None:
+            return None
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
+            packed = mask.to(
+                device=self.device_memory_monitor.device, dtype=torch.uint8
+            )
+            torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.MAX)
+            mask.copy_(packed.cpu().to(dtype=torch.bool))
+        trained = int(mask.sum().item())
+        return {
+            "vocab/trained(%)": 100.0 * trained / self.vocab_size,
+            "vocab/trained_count": trained,
+            "vocab/size": self.vocab_size,
+        }
 
     def should_log(self, step: int) -> bool:
         if self.step_last_log is None:
@@ -535,10 +616,14 @@ class MetricsProcessor(Configurable):
         assert self.num_flops_per_token > 0, "num_flops_per_token must be set"
 
         time_delta = time.perf_counter() - self.time_last_log
+        # Validation time is reported in the latency breakdown. Throughput and
+        # ETA stay on the training interval so a val step does not look stalled.
+        val_seconds = self.section_seconds.get("val", 0.0)
+        train_time_delta = max(time_delta - val_seconds, 0.0)
 
         performance = compute_training_performance_metrics(
             num_tokens=self.ntokens_since_last_log,
-            elapsed_time=time_delta,
+            elapsed_time=train_time_delta,
             non_data_parallel_size=self.parallelism_context.non_data_parallel_size,
             num_flops_per_token=self.num_flops_per_token,
             gpu_peak_flops=self.gpu_peak_flops,
@@ -549,9 +634,24 @@ class MetricsProcessor(Configurable):
         mfu = performance.get("mfu_percent")
 
         assert self.step_last_log is not None
-        time_end_to_end = time_delta / (step - self.step_last_log)
+        steps_since_log = step - self.step_last_log
+        if steps_since_log <= 0:
+            raise ValueError(
+                f"training log for step {step} has no steps since the previous "
+                f"log at {self.step_last_log}"
+            )
+        time_end_to_end = train_time_delta / steps_since_log
+        latency = _latency_per_step(
+            section_seconds=self.section_seconds,
+            wall_seconds=time.perf_counter() - self.latency_window_start,
+            steps=steps_since_log,
+        )
         time_data_loading = sum(self.data_loading_times) / len(self.data_loading_times)
-        time_data_loading_pct = 100 * sum(self.data_loading_times) / time_delta
+        time_data_loading_pct = (
+            100 * sum(self.data_loading_times) / train_time_delta
+            if train_time_delta > 0
+            else 0.0
+        )
 
         device_mem_stats = self.device_memory_monitor.get_peak_stats()
 
@@ -562,6 +662,14 @@ class MetricsProcessor(Configurable):
             "throughput(tps)": tps,
             "tflops": tflops,
             "time_metrics/end_to_end(s)": time_end_to_end,
+            "time_metrics/step(ms)": latency["step"] * 1000,
+            "time_metrics/data(ms)": latency["data"] * 1000,
+            "time_metrics/fwd(ms)": latency["fwd"] * 1000,
+            "time_metrics/bwd(ms)": latency["bwd"] * 1000,
+            "time_metrics/optim(ms)": latency["optim"] * 1000,
+            "time_metrics/ckpt(ms)": latency["ckpt"] * 1000,
+            "time_metrics/val(ms)": latency["val"] * 1000,
+            "time_metrics/other(ms)": latency["other"] * 1000,
             "time_metrics/data_loading(s)": time_data_loading,
             "time_metrics/data_loading(%)": time_data_loading_pct,
             "memory/max_active(GiB)": device_mem_stats.max_active_gib,
@@ -579,7 +687,7 @@ class MetricsProcessor(Configurable):
             metrics["progress(%)"] = progress
             if self.eta_started and step > self.step_last_log:
                 self.eta_steps += step - self.step_last_log
-                self.eta_seconds += time_delta
+                self.eta_seconds += train_time_delta
             self.eta_started = True
             remaining_steps = self.total_steps - step
             if self.eta_steps > 0 and remaining_steps > 0:
@@ -601,6 +709,14 @@ class MetricsProcessor(Configurable):
 
         color = self.color
         mfu_str = f"{mfu:.2f}%" if mfu is not None else "N/A"
+        vocab_str = ""
+        if extra_metrics and "vocab/trained(%)" in extra_metrics:
+            trained = int(extra_metrics["vocab/trained_count"])
+            vocab_size = int(extra_metrics["vocab/size"])
+            vocab_str = (
+                f"{color.white}vocab: {extra_metrics['vocab/trained(%)']:.2f}% "
+                f"({trained:,}/{vocab_size:,})  "
+            )
         logger.info(
             f"{color.red}{step_str}  "
             f"{color.green}loss: {global_avg_loss:8.5f}  "
@@ -609,25 +725,40 @@ class MetricsProcessor(Configurable):
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
             f"{color.blue}tps: {round(tps):,}  "
             f"{color.cyan}tflops: {tflops:,.2f}  "
-            f"{color.magenta}mfu: {mfu_str}{color.reset}"
+            f"{color.magenta}mfu: {mfu_str}  "
+            f"{vocab_str}"
+            f"{color.yellow}{_format_latency(latency)}{color.reset}"
         )
 
         self.ntokens_since_last_log = 0
         self.data_loading_times.clear()
+        self.section_seconds = {name: 0.0 for name in _LATENCY_SECTIONS}
+        self.latency_window_start = time.perf_counter()
         self.time_last_log = time.perf_counter()
         self.step_last_log = step
         self.device_memory_monitor.reset_peak_stats()
 
     def log_validation(
-        self, loss: float, step: int, extra_metrics: dict[str, Any] | None = None
+        self,
+        loss: float,
+        step: int,
+        extra_metrics: dict[str, Any] | None = None,
+        *,
+        num_tokens: int = 0,
+        elapsed_seconds: float | None = None,
     ):
-        time_delta = time.perf_counter() - self.time_last_log
-
         device_mem_stats = self.device_memory_monitor.get_peak_stats()
+        owns_training_window = elapsed_seconds is None
+        if owns_training_window:
+            elapsed_seconds = time.perf_counter() - self.time_last_log
+            num_tokens = self.ntokens_since_last_log
 
         # tokens per second per device, abbreviated as tps
-        tps = self.ntokens_since_last_log / (
-            time_delta * self.parallelism_context.non_data_parallel_size
+        tps = (
+            num_tokens
+            / (elapsed_seconds * self.parallelism_context.non_data_parallel_size)
+            if elapsed_seconds > 0
+            else 0.0
         )
 
         metrics = {
@@ -653,10 +784,11 @@ class MetricsProcessor(Configurable):
             f"{color.blue}tps: {round(tps):,}{color.reset}"
         )
 
-        self.ntokens_since_last_log = 0
-        self.time_last_log = time.perf_counter()
-        self.step_last_log = step
-        self.device_memory_monitor.reset_peak_stats()
+        if owns_training_window:
+            self.ntokens_since_last_log = 0
+            self.time_last_log = time.perf_counter()
+            self.step_last_log = step
+            self.device_memory_monitor.reset_peak_stats()
 
     def close(self):
         self.logger.close()

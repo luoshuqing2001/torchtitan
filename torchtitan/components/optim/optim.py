@@ -8,20 +8,20 @@ import logging
 from dataclasses import dataclass, field
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from torchtitan.config import Configurable
-from torchtitan.distributed import ParallelismContext, utils as dist_utils
+from torchtitan.distributed import ParallelismContext
+from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.cuda_graph import (
-    cuda_graphs_supported,
     NUM_CUDA_GRAPH_WARMUP_STEPS,
+    cuda_graphs_supported,
     wrap_with_cuda_graph,
 )
 
 from .ema import EMA
 from .lr_scheduler import LRSchedulersContainer
 from .optimizer import OptimizersContainer
-
 
 logger = logging.getLogger(__name__)
 
@@ -41,12 +41,19 @@ class Optim(Configurable):
         """Optional online EMA of model weights."""
         max_norm: float | int = 1.0
         """Maximum norm used for gradient clipping."""
+        cpu_norm_chunk_size: int = 0
+        """Parallel CPU FP32 L2 reduction chunk size; 0 keeps native rounding.
+
+        Nonzero values change floating-point summation order.
+        """
         enable_cuda_graph: bool = False
         """Capture gradient clipping and optimizer updates in one CUDA graph."""
 
         def __post_init__(self) -> None:
             if self.max_norm < 0:
                 raise ValueError("max_norm must be greater than or equal to 0.")
+            if self.cpu_norm_chunk_size < 0:
+                raise ValueError("cpu_norm_chunk_size must be nonnegative.")
 
     optimizers: OptimizersContainer
     lr_schedulers: LRSchedulersContainer
@@ -120,6 +127,7 @@ class Optim(Configurable):
             foreach=True,
             pp_mesh=self.parallelism_context.get_optional_mesh("pp"),
             ep_enabled=self.parallelism_context.ep_enabled,
+            cpu_norm_chunk_size=self.config.cpu_norm_chunk_size,
         )
         loss_is_finite = torch.isfinite(loss).all().to(torch.int32)
         if not self.parallelism_context.pp_enabled or self.pp_has_last_stage:

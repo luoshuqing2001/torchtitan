@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -181,6 +182,8 @@ class Validator(BaseValidator):
         )
 
         validation_iterator = iter(iterate_and_close_dataloader(validation_dataloader))
+        val_start = time.perf_counter()
+        val_tokens = 0
         while True:
             # pyrefly: ignore [missing-attribute, unsupported-operation]
             if self.config.steps != -1 and num_steps >= self.config.steps:
@@ -192,9 +195,7 @@ class Validator(BaseValidator):
                 for _ in range(num_pp_microbatches):
                     microbatch = next(validation_iterator)
                     local_valid_tokens += microbatch.num_valid_tokens
-                    self.metrics_processor.ntokens_since_last_log += (
-                        microbatch.labels.numel()
-                    )
+                    val_tokens += microbatch.labels.numel()
                     input_dict = microbatch.to_input_dict(device_type)
                     microbatch_group.append(input_dict)
             except StopIteration:
@@ -298,7 +299,12 @@ class Validator(BaseValidator):
             global_loss_sum = float(accumulated_loss.item())
         global_avg_loss = global_loss_sum / num_global_valid_tokens
 
-        self.metrics_processor.log_validation(loss=global_avg_loss, step=step)
+        self.metrics_processor.log_validation(
+            loss=global_avg_loss,
+            step=step,
+            num_tokens=val_tokens,
+            elapsed_seconds=time.perf_counter() - val_start,
+        )
 
         # Set model back to train mode
         for model in model_parts:

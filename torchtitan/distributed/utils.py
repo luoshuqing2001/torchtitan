@@ -597,6 +597,31 @@ def set_pg_timeouts(
         torch.distributed.set_timeout(timeout, group)
 
 
+def _cpu_norm_inputs(grads: list[torch.Tensor], chunk_size: int) -> list[torch.Tensor]:
+    """Expose independent CPU reduction rows without copying the gradients."""
+    inputs = []
+    for grad in grads:
+        if (
+            type(grad) is torch.Tensor
+            and grad.device.type == "cpu"
+            and grad.dtype == torch.float32
+            and grad.is_contiguous()
+            and grad.numel() > chunk_size
+        ):
+            flat = grad.view(-1)
+            end = flat.numel() // chunk_size * chunk_size
+            norms = torch.linalg.vector_norm(
+                flat[:end].view(-1, chunk_size), ord=2, dim=1
+            )
+            if end < flat.numel():
+                tail = torch.linalg.vector_norm(flat[end:], ord=2).reshape(1)
+                norms = torch.cat((norms, tail))
+            inputs.append(norms)
+        else:
+            inputs.append(grad)
+    return inputs
+
+
 @torch.no_grad()
 def clip_grad_norm_(
     parameters: torch.Tensor | Iterable[torch.Tensor],
@@ -606,6 +631,7 @@ def clip_grad_norm_(
     foreach: bool | None = None,
     pp_mesh: DeviceMesh | None = None,
     ep_enabled: bool = False,
+    cpu_norm_chunk_size: int = 0,
 ) -> torch.Tensor:
     """
     Clip the gradient norm of an iterable of parameters.
@@ -630,11 +656,15 @@ def clip_grad_norm_(
         pp_mesh: Pipeline Parallel device mesh. If not None, will reduce gradient norm across PP stages.
         ep_dense_params_mesh_ndim: Mesh ndim of the dense params when EP is used. If EP is not used,
             set it to ``None``.
+        cpu_norm_chunk_size: Parallelize CPU FP32 L2 norms in chunks when positive.
+            This changes floating-point summation order. Zero preserves the native path.
 
     Returns:
         Total norm of the parameter gradients (viewed as a single vector).
 
     """
+    if cpu_norm_chunk_size < 0:
+        raise ValueError("cpu_norm_chunk_size must be nonnegative.")
     if ep_enabled:
         return _clip_grad_norm_with_ep(
             parameters,
@@ -651,6 +681,8 @@ def clip_grad_norm_(
         # prevent generators from being exhausted
         parameters = list(parameters)
     grads = [p.grad for p in parameters if p.grad is not None]
+    if cpu_norm_chunk_size and float(norm_type) == 2.0:
+        grads = _cpu_norm_inputs(grads, cpu_norm_chunk_size)
     total_norm = torch.nn.utils.get_total_norm(
         grads, norm_type, error_if_nonfinite, foreach
     )
