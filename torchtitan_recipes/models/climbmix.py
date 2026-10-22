@@ -56,11 +56,15 @@ def climbmix_validator(
     val_files: list[str],
     *,
     global_tokens_per_step: int,
+    microbatch_tokens: int | None = None,
+    val_every_tokens: int = _VAL_EVERY_TOKENS,
 ) -> Validator.Config:
     """Validation cadence scaled to the training step's token count.
 
     Data-parallel degree is greater than 1, so every rank must run the same
-    positive number of validation steps.
+    positive number of validation steps. A validation step scores one
+    microbatch per rank, so ``microbatch_tokens`` (global tokens in one
+    microbatch) sets the step count when training accumulates gradients.
     """
     if global_tokens_per_step <= 0:
         raise ValueError(
@@ -70,17 +74,17 @@ def climbmix_validator(
     freq = (
         int(freq_env)
         if freq_env is not None
-        else max(1, round(_VAL_EVERY_TOKENS / global_tokens_per_step))
+        else max(1, round(val_every_tokens / global_tokens_per_step))
     )
     if freq <= 0:
         raise ValueError(f"VAL_FREQ must be positive, got {freq}")
     return Validator.Config(
         freq=freq,
         validate_on_step_one=False,
-        steps=max(1, round(_VAL_TOKENS / global_tokens_per_step)),
+        steps=max(
+            1, round(_VAL_TOKENS / (microbatch_tokens or global_tokens_per_step))
+        ),
         dataloader=GrainDataLoader.Config(
-            dataset=ConcatThenSplitPackingConfig(
-                dataset=climbmix_dataset(val_files)
-            ),
+            dataset=ConcatThenSplitPackingConfig(dataset=climbmix_dataset(val_files)),
         ),
     )

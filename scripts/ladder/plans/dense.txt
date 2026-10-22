@@ -1,0 +1,7 @@
+# <flavor> <variant: 0=dense|ple|engram> <micro_batch> [KEY=VALUE ...]
+# Global batch is fixed per flavor in the recipe (512K tokens d200m/d400m,
+# 1M d700m/d1b); micro 64 fits every flavor and variant on H100 80GB.
+d200m 0 64
+d400m 0 64
+d700m 0 64
+d1b 0 64

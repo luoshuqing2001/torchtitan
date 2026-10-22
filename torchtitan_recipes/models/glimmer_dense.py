@@ -20,7 +20,7 @@ from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.optim import Optim
-from torchtitan.config import TrainingConfig
+from torchtitan.config import Function, TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config.transform import Float8LinearConverter
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
@@ -32,6 +32,7 @@ from torchtitan.models.utils import get_nparams_and_active_nparams
 from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.observability.profiler import Profiler
 from torchtitan.trainer import Trainer
+
 from torchtitan_recipes.models.climbmix import (
     climbmix_dataset,
     climbmix_train_and_val_files,
@@ -50,6 +51,32 @@ _DEFAULT_LOCAL_BATCH = {
     "d700m": 16,
     "d1b": 8,
 }
+# Global tokens per optimizer step, fixed per flavor near the compute-optimal
+# batch B = 0.292 * C^0.3271 (DeepSeek LLM, C = 6 * N * 20N). Dense, PLE and
+# Engram at one flavor share it; LOCAL_BATCH_SIZE only sets the microbatch and
+# gradient accumulation makes up the rest. Override with GLOBAL_BATCH_TOKENS.
+_DEFAULT_GLOBAL_BATCH_TOKENS = {
+    "d200m": 2**19,
+    "d400m": 2**19,
+    "d700m": 2**20,
+    "d1b": 2**20,
+}
+# Validation every 2^28 tokens, a multiple of every global batch above, so
+# val points of all runs land on the same token counts.
+_VAL_EVERY_TOKENS = 2**28
+# Checkpoints are placed by tokens, not steps, so every run saves at the
+# same token counts. Resumable state every _VAL_EVERY_TOKENS (one per val
+# point, CKPT_KEEP most recent kept); snapshots at doubling token counts from
+# 2^28 (268M, 537M, 1.07B, ...), evenly spaced on a log axis, are exempt from
+# that purge and kept for evaluation and decay branches.
+_FIRST_SNAPSHOT_TOKENS = 2**28
+
+
+def _is_snapshot_step(step: int, *, tokens_per_step: int) -> bool:
+    tokens = step * tokens_per_step
+    return tokens >= _FIRST_SNAPSHOT_TOKENS and tokens & (tokens - 1) == 0
+
+
 # 20 tokens per dense parameter. PLE and Engram at the same flavor
 # use this budget too, so the three runs see the same data.
 _TOKENS_PER_PARAM = 20
@@ -208,7 +235,20 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
     )
     lr = float(os.environ.get("LR", str(_DEFAULT_LR[flavor])))
     world_size = int(os.environ.get("NGPU", "4"))
-    global_tokens_per_step = local_batch * model_config.max_context_length * world_size
+    microbatch_tokens = local_batch * model_config.max_context_length * world_size
+    global_tokens_per_step = int(
+        os.environ.get("GLOBAL_BATCH_TOKENS", str(_DEFAULT_GLOBAL_BATCH_TOKENS[flavor]))
+    )
+    if global_tokens_per_step % microbatch_tokens != 0:
+        raise ValueError(
+            f"GLOBAL_BATCH_TOKENS={global_tokens_per_step} is not a multiple of "
+            f"LOCAL_BATCH_SIZE * seq_len * NGPU = {microbatch_tokens}"
+        )
+    if _VAL_EVERY_TOKENS % global_tokens_per_step != 0:
+        raise ValueError(
+            f"GLOBAL_BATCH_TOKENS={global_tokens_per_step} must divide "
+            f"the validation interval {_VAL_EVERY_TOKENS}"
+        )
     steps_env = os.environ.get("TRAIN_STEPS")
     if steps_env is not None:
         steps = int(steps_env)
@@ -225,7 +265,11 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
                 ),
             )
         )
-        steps = (token_budget + global_tokens_per_step - 1) // global_tokens_per_step
+        # Round the budget up to whole validation intervals so the last step
+        # is also a validation and checkpoint step (the trainer validates only
+        # at multiples of the interval, never specially at the last step).
+        intervals = -(-token_budget // _VAL_EVERY_TOKENS)
+        steps = intervals * (_VAL_EVERY_TOKENS // global_tokens_per_step)
     train_files, val_files = climbmix_train_and_val_files(data_dir)
     dataset = climbmix_dataset(train_files)
     parallelism = ParallelismConfig(
@@ -275,6 +319,7 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
                 local_batch * model_config.max_context_length
             ),
             max_context_length=model_config.max_context_length,
+            num_tokens_per_train_step=global_tokens_per_step,
             steps=steps,
             # Varlen metadata is data-dependent unless max_num_documents is
             # fixed, so CUDA graphs stay off.
@@ -283,8 +328,19 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
         validator=climbmix_validator(
             val_files,
             global_tokens_per_step=global_tokens_per_step,
+            microbatch_tokens=microbatch_tokens,
+            val_every_tokens=_VAL_EVERY_TOKENS,
         ),
-        checkpointer=CheckpointManager.Config(interval=200),
+        checkpointer=CheckpointManager.Config(
+            interval=_VAL_EVERY_TOKENS // global_tokens_per_step,
+            keep_latest_k=int(os.environ.get("CKPT_KEEP", "10")),
+            purge_exempt=Function.Config(
+                # pyrefly: ignore [bad-argument-type]
+                fn=lambda step: _is_snapshot_step(
+                    step, tokens_per_step=global_tokens_per_step
+                )
+            ),
+        ),
         activation_checkpoint=SelectiveAC.Config(
             recompute_linear=(
                 memory == "ple" and os.environ.get("PLE_RECOMPUTE_LINEAR", "0") == "1"
