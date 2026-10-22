@@ -27,7 +27,8 @@ nohup ./scripts/ladder/run_ladder.sh scripts/ladder/plans/dense.txt \
 
 A plan line is `<flavor> <variant> <micro_batch> [KEY=VALUE ...]`; the
 optional pairs are extra environment for that run, e.g.
-`d200m ple 64 TRAIN_STEPS=9922`. Runs go one after another. Relaunching the
+`d200m ple 64 TRAIN_STEPS=9922`. A non-default `PLE_DIM` (512 or 1024) is
+added to the run name, e.g. `d200m_ple512`. Runs go one after another. Relaunching the
 runner skips runs with a `DONE` marker and resumes unfinished ones from their
 latest checkpoint.
 

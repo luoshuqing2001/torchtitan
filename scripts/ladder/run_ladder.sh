@@ -122,6 +122,9 @@ done
 while read -r flavor variant mb extra; do
   [[ -z "${flavor}" || "${flavor}" == \#* ]] && continue
   name=${flavor}_$([[ $variant == 0 ]] && echo dense || echo $variant)
+  # A non-default PLE/Engram width (recipe default 256) gets its own run name.
+  dim=$(grep -oE "PLE_DIM=[0-9]+" <<< "${extra}" | cut -d= -f2)
+  [[ -n $dim && $dim != 256 ]] && name=${name}${dim}
   out=outputs/ladder/$name
   if [[ ! -f $out/DONE ]] && tail -n 50 $out/train.log 2>/dev/null | grep -q "Training completed"; then
     touch $out/DONE; echo "[ladder] $(date -u +%FT%TZ) done $name (adopted)"
