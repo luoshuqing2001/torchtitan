@@ -34,7 +34,7 @@ def glimmer_dense():
         flags[name] = value == "1"
     config = base_recipe()
     if config.model.engram is None:
-        raise ValueError("Set PLE=engram for the Engram optimization recipe")
+        raise ValueError("Set PLE=engram_legacy for the Engram optimization recipe")
     engram = config.model.engram
     if flags["ENGRAM_COMPILE_FP8"]:
         config.compile.regions.append("float8_quantize")

@@ -52,14 +52,14 @@ def test_compact_overflow_falls_back(tokens):
 
 
 def test_dram_default_is_gpu(monkeypatch):
-    monkeypatch.setenv("PLE", "engram")
+    monkeypatch.setenv("PLE", "engram_legacy")
     monkeypatch.delenv("ENGRAM_ASYNC_TRAINING", raising=False)
     config = glimmer_dense()
     assert config.model.__class__.__qualname__ == "GlimmerDenseModel.Config"
 
 
 def test_dram_recipe_targets_engram_table(monkeypatch):
-    monkeypatch.setenv("PLE", "engram")
+    monkeypatch.setenv("PLE", "engram_legacy")
     monkeypatch.setenv("ENGRAM_ASYNC_TRAINING", "1")
     config = glimmer_dense()
     assert config.optim.table_path == "engram.table"
@@ -205,7 +205,7 @@ def test_device_inverse_packet_matches_expanded(rows):
 def test_gpu_projections_keep_native_optimizer_group(monkeypatch):
     import re
 
-    monkeypatch.setenv("PLE", "engram")
+    monkeypatch.setenv("PLE", "engram_legacy")
     monkeypatch.setenv("ENGRAM_ASYNC_TRAINING", "1")
     monkeypatch.setenv("ENGRAM_DRAM_GPU_PROJECTIONS", "1")
     config = glimmer_dense()
@@ -298,7 +298,7 @@ def test_value_checkpoint_preserves_projection_gradients(requires_grad):
 
 
 def test_workspace_reuse_requires_double_buffer(monkeypatch):
-    monkeypatch.setenv("PLE", "engram")
+    monkeypatch.setenv("PLE", "engram_legacy")
     monkeypatch.setenv("ENGRAM_ASYNC_TRAINING", "1")
     monkeypatch.setenv("ENGRAM_DRAM_REUSE_CACHE_WORKSPACE", "1")
     monkeypatch.setenv("ENGRAM_DRAM_DOUBLE_BUFFER_CACHE", "0")
@@ -393,7 +393,7 @@ def test_aligned_value_linear_second_derivatives():
 
 
 def test_aligned_value_forward_requires_aligned_recomputation(monkeypatch):
-    monkeypatch.setenv("PLE", "engram")
+    monkeypatch.setenv("PLE", "engram_legacy")
     monkeypatch.setenv("ENGRAM_ASYNC_TRAINING", "1")
     monkeypatch.setenv("ENGRAM_DRAM_ALIGN_VALUE_FORWARD", "1")
     with pytest.raises(ValueError, match="requires aligned prefetched values"):
@@ -590,7 +590,7 @@ def test_single_cache_chunk_patch_preserves_other_rows(monkeypatch, counts, rank
 
 
 def test_single_cache_requires_prepared_reuse_path(monkeypatch):
-    monkeypatch.setenv("PLE", "engram")
+    monkeypatch.setenv("PLE", "engram_legacy")
     monkeypatch.setenv("ENGRAM_ASYNC_TRAINING", "1")
     monkeypatch.setenv("ENGRAM_DRAM_SINGLE_BUFFER_CACHE", "1")
     with pytest.raises(ValueError, match="Single buffering requires"):

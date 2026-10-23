@@ -93,7 +93,7 @@ def test_cpu_fallback_preserves_training_and_checkpoint(dtype, checkpoint):
 @pytest.mark.parametrize("flag", FLAGS)
 @pytest.mark.parametrize("value", [None, "0", "1"])
 def test_engram_flags_default_off(monkeypatch, flag, value):
-    monkeypatch.setenv("PLE", "engram")
+    monkeypatch.setenv("PLE", "engram_legacy")
     monkeypatch.setenv("PLE_ASYNC_TRAINING", "0")
     for name in FLAGS:
         monkeypatch.delenv(name, raising=False)
@@ -115,7 +115,7 @@ def test_engram_flags_default_off(monkeypatch, flag, value):
 
 @pytest.mark.parametrize("flag", FLAGS)
 def test_engram_flags_reject_invalid_values(monkeypatch, flag):
-    monkeypatch.setenv("PLE", "engram")
+    monkeypatch.setenv("PLE", "engram_legacy")
     monkeypatch.setenv(flag, "yes")
     with pytest.raises(ValueError, match=flag):
         glimmer_dense()
@@ -123,7 +123,7 @@ def test_engram_flags_reject_invalid_values(monkeypatch, flag):
 
 def test_engram_recipe_requires_engram(monkeypatch):
     monkeypatch.setenv("PLE", "ple")
-    with pytest.raises(ValueError, match="PLE=engram"):
+    with pytest.raises(ValueError, match="PLE=engram_legacy"):
         glimmer_dense()
 
 

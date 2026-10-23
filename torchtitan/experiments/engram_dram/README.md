@@ -6,11 +6,11 @@ across the data-parallel ranks. Projection parameters remain replicated in
 DRAM. The d200m backbone and its Moonlight Muon optimizer are unchanged.
 
 `ENGRAM_ASYNC_TRAINING=0` is the default. It returns the ordinary Engram recipe
-with device-resident parameters. Set `PLE=engram` to select the architecture;
+with device-resident parameters. Set `PLE=engram_legacy` to select the architecture;
 `PLE_ASYNC_TRAINING` remains off for this experiment.
 
 ```bash
-export NGPU=4 FLAVOR=d200m PLE=engram PLE_DIM=1024 FP8=1
+export NGPU=4 FLAVOR=d200m PLE=engram_legacy PLE_DIM=1024 FP8=1
 export LOCAL_BATCH_SIZE=128 TRAIN_STEPS=100 OMP_NUM_THREADS=16
 export ENGRAM_ASYNC_TRAINING=1
 .venv/bin/torchrun --standalone --nproc-per-node=4 --numa-binding=exclusive \

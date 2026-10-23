@@ -38,6 +38,9 @@ def set_glimmer_dense_sharding_config(
                 _set_layer_ple_sharding(layer_cfg.layer_ple, enable_sp=enable_sp)
     if config.engram is not None:
         _set_engram_sharding(config.engram, enable_sp=enable_sp)
+    if config.deepseek_engram is not None:
+        for layer in config.deepseek_engram.layers.values():
+            _set_deepseek_engram_sharding(layer, enable_sp=enable_sp)
 
 
 def _activation_layout(*, enable_sp: bool):
@@ -109,6 +112,40 @@ def _set_engram_sharding(engram_config, *, enable_sp: bool) -> None:
             "tokens": tokens,
             "positions": tokens,
         },
+        out_src_shardings=activation,
+        out_dst_shardings=activation,
+        local_spmd=True,
+    )
+
+
+def _set_deepseek_engram_sharding(layer_config, *, enable_sp: bool) -> None:
+    """Replicate one Engram layer's table and projections; run it locally."""
+    activation = _activation_layout(enable_sp=enable_sp)
+    tokens = token_id_placement(enable_sp=enable_sp)
+    weight = dense_param_placement(tp=spmd.I)
+    layer_config.sharding_config = ShardingConfig(
+        state_shardings={
+            name: weight
+            for name in (
+                "key_weight",
+                "value_weight",
+                "query_norm_weight",
+                "key_norm_weight",
+                "conv_norm_weight",
+                "conv_weight",
+            )
+        },
+        in_src_shardings={"hidden": activation, "tokens": tokens, "positions": tokens},
+        in_dst_shardings={"hidden": activation, "tokens": tokens, "positions": tokens},
+        out_src_shardings=activation,
+        out_dst_shardings=activation,
+        local_spmd=True,
+    )
+    assert layer_config.table is not None
+    layer_config.table.sharding_config = ShardingConfig(
+        state_shardings={"weight": weight},
+        in_src_shardings={"rows": tokens},
+        in_dst_shardings={"rows": tokens},
         out_src_shardings=activation,
         out_dst_shardings=activation,
         local_spmd=True,

@@ -90,15 +90,15 @@ _DEFAULT_LR = {
 
 
 def _memory_variant(raw: str) -> str:
-    """Map ``PLE`` to ``none``, ``ple``, or ``engram``."""
+    """Map ``PLE`` to ``none``, ``ple``, ``engram``, or ``engram_legacy``."""
     value = raw.strip().lower()
     if value in ("0", "none", "off", ""):
         return "none"
     if value in ("1", "ple", "gemma"):
         return "ple"
-    if value == "engram":
-        return "engram"
-    raise ValueError(f"PLE must be 0, ple, or engram, got {raw!r}")
+    if value in ("engram", "engram_legacy"):
+        return value
+    raise ValueError(f"PLE must be 0, ple, engram, or engram_legacy, got {raw!r}")
 
 
 def _ple_dim(raw: str) -> int:
@@ -143,6 +143,8 @@ def _dump_folder(flavor: str, memory: str, ple_dim: int) -> str:
     if memory == "ple":
         return f"./outputs/glimmer_dense_olmo3_ple/{name}"
     if memory == "engram":
+        return f"./outputs/glimmer_dense_olmo3_deepseek_engram/{name}"
+    if memory == "engram_legacy":
         return f"./outputs/glimmer_dense_olmo3_engram/{name}"
     return f"./outputs/glimmer_dense_olmo3/{flavor}"
 
@@ -208,6 +210,7 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
                 model_compile_enabled=True,
             )
         )
+    tokenizer_dir = os.environ.get("TOKENIZER_DIR", "./assets/hf/OLMo3")
     model_config = build_model_config(
         flavor,
         seq_len=seq_len,
@@ -215,6 +218,7 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
         memory=memory,
         ple_dim=ple_dim,
         converters=converters or None,
+        tokenizer_path=os.path.join(tokenizer_dir, "tokenizer.json"),
     )
     model_config.ple_async_training = ple_async_training
     model_config.ple_unbind_inputs = unbind_flag == "1"
@@ -279,6 +283,18 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
         fsdp_reshard_after_forward="never",
     )
     optimizer = glimmer_muon_optimizer(model_config, lr=lr, parallelism=parallelism)
+    if model_config.deepseek_engram is not None:
+        # The Engram paper trains the n-gram tables with Adam at 5x the
+        # learning rate and no weight decay.
+        optimizer.optimizers.insert(
+            -1,
+            replace(
+                optimizer.optimizers[-1],
+                pattern=r"^deepseek_engram\.layers\.\d+\.table\.weight$",
+                lr=5 * lr,
+                weight_decay=0.0,
+            ),
+        )
     if ple_async_training and os.environ.get("PLE_CPU_FUSED_ADAM", "0") == "1":
         optimizer.optimizers.insert(
             -1,
@@ -299,7 +315,7 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
                 global_vocab_size=decoder_vocab_size(model_config),
             ),
         ),
-        hf_assets_path=os.environ.get("TOKENIZER_DIR", "./assets/hf/OLMo3"),
+        hf_assets_path=tokenizer_dir,
         metrics=MetricsProcessor.Config(
             log_freq=log_freq,
             enable_tensorboard=True,

@@ -12,31 +12,32 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
-from torch.nn.attention.flex_attention import BlockMask, and_masks
+from torch.nn.attention.flex_attention import and_masks, BlockMask
 
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
 from torchtitan.models.common.attention import (
     AttentionMasksType,
-    FlexInnerAttention,
-    VarlenInnerAttention,
     create_attention_mask,
     create_varlen_metadata_for_document,
+    FlexInnerAttention,
     get_causal_mask_mod,
     get_efficient_causal_mask_mod_for_packed_document,
     get_sliding_window_mask_mod,
+    VarlenInnerAttention,
 )
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.muse_glimmer.model import (
+    _window_mask_key,
     Attention,
     MuseGlimmerTransformerBlock,
-    _window_mask_key,
 )
 from torchtitan.models.utils import (
     get_nparams_and_active_nparams,
     quadratic_attention_flops_per_token,
 )
 
+from .deepseek_engram import DeepSeekEngram
 from .engram import ENGRAM_LAYER_INDEX, NGramEngram
 from .ple import LayerPLE, PerLayerEmbedder
 from .ple_dram import (
@@ -92,12 +93,16 @@ class GlimmerDenseModel(Decoder):
         ple_async_training: bool = False
         ple_unbind_inputs: bool = False
         engram: NGramEngram.Config | None = None
+        deepseek_engram: DeepSeekEngram.Config | None = None
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
             engram = getattr(model, "engram", None)
             excluded = () if engram is None else (engram.table,)
+            deepseek_engram = getattr(model, "deepseek_engram", None)
+            if deepseek_engram is not None:
+                excluded = excluded + deepseek_engram.tables()
             nparams, active_nparams = get_nparams_and_active_nparams(
                 model,
                 modules_excluded_from_active_params=excluded,
@@ -135,6 +140,9 @@ class GlimmerDenseModel(Decoder):
         super().__init__(config)
         self.ple = None if config.ple is None else config.ple.build()
         self.engram = None if config.engram is None else config.engram.build()
+        self.deepseek_engram = (
+            None if config.deepseek_engram is None else config.deepseek_engram.build()
+        )
         if config.ple_async_training:
             for parameter in _iter_ple_parameters(self):
                 parameter._torchtitan_skip_fsdp = True
@@ -190,6 +198,13 @@ class GlimmerDenseModel(Decoder):
                 and positions is not None
             ):
                 h = self.engram(h, tokens, positions)
+            if (
+                self.deepseek_engram is not None
+                and index in self.deepseek_engram.layer_indices
+            ):
+                if not have_tokens or positions is None:
+                    raise ValueError("Engram needs token ids and positions")
+                h = self.deepseek_engram(index, h, tokens, positions)
             layer_input = None
             if per_layer_inputs is not None:
                 layer_input = (

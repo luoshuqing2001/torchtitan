@@ -17,8 +17,10 @@ Every flavor uses the same block as the MoE run's attention side:
 Depth is a multiple of 4 so the iRoPE / window cycle closes. Counts below
 include the tied embedding once. The step names stay ``d200m`` through
 ``d1b``; the smaller OLMo3 table is why the totals sit below the old
-Qwen3.8 counts. PLE and Engram at the same ``ple_dim`` match in both total
-and active parameters.
+Qwen3.8 counts. PLE and Engram at the same ``ple_dim`` match in total
+parameters. ``engram`` is DeepSeek Engram (``deepseek_engram.py``);
+``engram_legacy`` is the earlier single-layer variant kept for the
+engram_dram and engram_optim experiments.
 
 - ``d200m``: dim 1024, 12 layers, 16/4 heads, FFN 3072. 260,097,024.
 - ``d400m``: dim 1280, 16 layers, 20/5 heads, FFN 3840. 456,213,760.
@@ -46,9 +48,20 @@ from torchtitan.models.muse_glimmer.flavors import (
 )
 from torchtitan.models.muse_glimmer.model import RMSGainCenterNorm
 
+from .deepseek_engram import (
+    active_params_per_layer,
+    compression_lookup,
+    DeepSeekEngram,
+    engram_layer_indices,
+    EngramLayer,
+    HashedTable,
+    head_table_sizes,
+    layer_multipliers,
+    NUM_HEADS,
+)
 from .engram import EngramTable, EngramUpdate, NGramEngram, rows_per_head_matching_ple
 from .model import GlimmerDenseBlock, GlimmerDenseModel
-from .ple import LayerPLE, PerLayerContext, PerLayerEmbedder, PLE_DIM_TIERS, _PLE_DIM
+from .ple import _PLE_DIM, LayerPLE, PerLayerContext, PerLayerEmbedder, PLE_DIM_TIERS
 
 __all__ = [
     "MODEL_FLAVORS",
@@ -175,6 +188,73 @@ def _engram_config(dim: int, n_layers: int, ple_dim: int) -> NGramEngram.Config:
     )
 
 
+def _ple_extra_params(dim: int, n_layers: int, ple_dim: int) -> int:
+    """Parameters PLE adds to the dense model at this ``ple_dim``."""
+    with torch.device("meta"):
+        modules = [_ple_config(dim, n_layers, ple_dim).build()]
+        modules += [_layer_ple(dim, ple_dim).build() for _ in range(n_layers)]
+    return sum(p.numel() for module in modules for p in module.parameters())
+
+
+def _deepseek_engram_config(
+    dim: int,
+    n_layers: int,
+    ple_dim: int,
+    tokenizer_path: str | None,
+) -> DeepSeekEngram.Config:
+    """Two Engram layers whose total parameters match PLE at ``ple_dim``.
+
+    The concatenated memory width is ``4 * ple_dim`` (1024 at the default
+    256, the reference's two orders x 512), split over 16 heads. The tables
+    take what is left of the PLE budget after the projections; each head gets
+    a distinct prime row count, chosen as large as the budget allows.
+    """
+    memory_dim = 4 * ple_dim
+    head_dim = memory_dim // NUM_HEADS
+    indices = engram_layer_indices(n_layers)
+    budget = _ple_extra_params(dim, n_layers, ple_dim) - len(indices) * (
+        active_params_per_layer(dim, memory_dim)
+    )
+    rows = budget // (head_dim * NUM_HEADS * len(indices))
+    sizes = head_table_sizes(rows, len(indices))
+    # Distinct primes overshoot the budget a little; step the start down.
+    while (excess := sum(sum(layer) for layer in sizes) * head_dim - budget) > 0:
+        rows -= max(1, excess // (head_dim * 64))
+        sizes = head_table_sizes(rows, len(indices))
+    lookup = compression_lookup(tokenizer_path, _VOCAB_SIZE)
+    compressed_vocab = int(lookup.max()) + 1
+    layer_init = {
+        "key_weight": partial(nn.init.normal_, std=0.02),
+        "value_weight": _residual_output_weight_init(n_layers),
+        "query_norm_weight": nn.init.ones_,
+        "key_norm_weight": nn.init.ones_,
+        "conv_norm_weight": nn.init.ones_,
+        "conv_weight": nn.init.zeros_,
+    }
+    return DeepSeekEngram.Config(
+        layers={
+            index: EngramLayer.Config(
+                dim=dim,
+                memory_dim=memory_dim,
+                layer_id=index,
+                table_sizes=sizes[position],
+                multipliers=layer_multipliers(index, compressed_vocab),
+                pad_id=int(lookup[_EOS_TOKEN_ID]),
+                eos_token_id=_EOS_TOKEN_ID,
+                vocab_size=_VOCAB_SIZE,
+                tokenizer_path=tokenizer_path,
+                table=HashedTable.Config(
+                    num_rows=sum(sizes[position]),
+                    head_dim=head_dim,
+                    param_init={"weight": partial(nn.init.normal_, std=0.02)},
+                ),
+                param_init=layer_init,
+            )
+            for position, index in enumerate(indices)
+        }
+    )
+
+
 def _flavor_config(
     dim: int,
     n_layers: int,
@@ -183,6 +263,7 @@ def _flavor_config(
     seq_len: int,
     memory: str = "none",
     ple_dim: int = _PLE_DIM,
+    tokenizer_path: str | None = None,
 ) -> GlimmerDenseModel.Config:
     n_heads = dim // _HEAD_DIM
     n_kv_heads = n_heads // 4
@@ -239,7 +320,14 @@ def _flavor_config(
         layers=layers,
         ple=_ple_config(dim, n_layers, ple_dim) if memory == "ple" else None,
         engram=(
-            _engram_config(dim, n_layers, ple_dim) if memory == "engram" else None
+            _engram_config(dim, n_layers, ple_dim)
+            if memory == "engram_legacy"
+            else None
+        ),
+        deepseek_engram=(
+            _deepseek_engram_config(dim, n_layers, ple_dim, tokenizer_path)
+            if memory == "engram"
+            else None
         ),
     )
 
@@ -258,6 +346,7 @@ def build_model_config(
     memory: str = "none",
     ple_dim: int = _PLE_DIM,
     converters: list[ModelConfigConverter.Config] | None = None,
+    tokenizer_path: str | None = None,
 ) -> GlimmerDenseModel.Config:
     dim, n_layers, max_context_len = MODEL_FLAVORS[flavor]
     context_len = seq_len or max_context_len
@@ -266,14 +355,13 @@ def build_model_config(
             f"Requested seq_len {context_len} exceeds max context length "
             f"{max_context_len} for flavor {flavor}"
         )
-    if memory not in ("none", "ple", "engram"):
+    if memory not in ("none", "ple", "engram", "engram_legacy"):
         raise ValueError(
-            f"memory must be 'none', 'ple', or 'engram', got {memory!r}"
+            "memory must be 'none', 'ple', 'engram', or 'engram_legacy', "
+            f"got {memory!r}"
         )
     if ple_dim not in PLE_DIM_TIERS:
-        raise ValueError(
-            f"ple_dim must be one of {PLE_DIM_TIERS}, got {ple_dim}"
-        )
+        raise ValueError(f"ple_dim must be one of {PLE_DIM_TIERS}, got {ple_dim}")
     config = _flavor_config(
         dim,
         n_layers,
@@ -281,6 +369,7 @@ def build_model_config(
         seq_len=context_len,
         memory=memory,
         ple_dim=ple_dim,
+        tokenizer_path=tokenizer_path,
     )
     if converters is not None:
         validate_converter_compatibility(converters)

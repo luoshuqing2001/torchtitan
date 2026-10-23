@@ -9,9 +9,10 @@
 import os
 from dataclasses import fields, replace
 
+from torchtitan_recipes.models.glimmer_dense import glimmer_dense as base_recipe
+
 from torchtitan.experiments.ple_dram_shard.optim import RowShardedOptim
 from torchtitan.experiments.ple_dram_shard.overlap import CPUOverlapOptimizersContainer
-from torchtitan_recipes.models.glimmer_dense import glimmer_dense as base_recipe
 
 from .model import DRAMEngram, DRAMEngramModel
 
@@ -62,7 +63,7 @@ def glimmer_dense():
         flags[name] = flag == "1"
     config = base_recipe()
     if config.model.engram is None:
-        raise ValueError("Set PLE=engram for the Engram DRAM recipe")
+        raise ValueError("Set PLE=engram_legacy for the Engram DRAM recipe")
     if flags["ENGRAM_COMPILE_FP8"]:
         config.compile.regions.append("float8_quantize")
     asynchronous = flags["ENGRAM_ASYNC_TRAINING"]
