@@ -13,7 +13,9 @@
 #
 # A finished run leaves outputs/ladder/<name>/DONE and is skipped; an
 # interrupted run resumes from its latest checkpoint when relaunched. A run
-# that hits OOM is retried with half the microbatch (same tokens per step).
+# that hits OOM is retried with half the microbatch (same tokens per step); any
+# other failure (e.g. a transient "CUDA error: unspecified launch failure") is
+# retried from the latest checkpoint up to MAX_RETRIES times (default 2).
 #
 # With R2 credentials ($R2_ENV), logs and TensorBoard go to $R2_DEST/<name>/
 # every 30 min, and snapshot checkpoints (doubling token counts from 2^28, plus
@@ -132,6 +134,7 @@ while read -r flavor variant mb extra; do
   fi
   if [[ -f $out/DONE ]]; then echo "[ladder] skip $name (done)"; continue; fi
   mkdir -p $out
+  retries=0
   while :; do
     echo "[ladder] $(date -u +%FT%TZ) start $name micro=$mb ${extra}"
     echo "===== $(date -u +%FT%TZ) launch micro=$mb ${extra} =====" >> $out/train.log
@@ -141,6 +144,10 @@ while read -r flavor variant mb extra; do
       touch $out/DONE; echo "[ladder] $(date -u +%FT%TZ) done $name"; break
     elif [[ $mb -gt 8 ]] && tail -n 300 $out/train.log | grep -qiE "OutOfMemory|out of memory"; then
       mb=$((mb / 2)); echo "[ladder] $(date -u +%FT%TZ) OOM $name, retry micro=$mb"
+    elif (( retries < ${MAX_RETRIES:-2} )); then
+      retries=$((retries + 1))
+      echo "[ladder] $(date -u +%FT%TZ) $name rc=$rc, retry $retries/${MAX_RETRIES:-2} from the latest checkpoint"
+      sleep 60
     else
       echo "[ladder] $(date -u +%FT%TZ) FAILED $name rc=$rc, see $out/train.log"; break
     fi
