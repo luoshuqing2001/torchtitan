@@ -1,5 +1,6 @@
-# Queue after d400m_dense_qmlp_d200mcfg.
 # 1) qmlpdeep at d200m with the d200m_dense recipe (LR 4e-4, 9922 steps = 5.20B tokens).
 d200m 0 64 ARCH=qmlpdeep TRAIN_STEPS=9922
-# 2) resume the first qmlp run (same as plans/qmlp.txt) from its latest checkpoint.
+# 2) the first qmlp at the d200m recipe, stopped early; resumes from its latest checkpoint if any.
+d400m 0 64 ARCH=qmlp LR=4e-4 TRAIN_STEPS=9922 RUN_TAG=d200mcfg
+# 3) the first qmlp at the d400m recipe, resumes from step-512.
 d400m 0 64 ARCH=qmlp
