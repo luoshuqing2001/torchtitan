@@ -183,7 +183,10 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
     ``ARCH=qmlp`` removes every FFN and makes each sliding-window layer's
     query projection a GELU MLP of width ``QMLP_RATIO * dim`` (default 1.375).
     It keeps the dense ladder's token budget, so it sees the same data as the
-    dense run at that flavor.
+    dense run at that flavor. ``ARCH=qmlpdeep`` keeps the dense model's
+    global-layer count, puts ``QMLP_SWA_PER_FULL`` (default 5) sliding-window
+    layers before each, and uses query MLP width ``QMLP_INTERMEDIATE``
+    (default 2 * dim).
 
     Matrix parameters use Moonlight Muon. Embeddings, norms, and the LM head
     stay on AdamW at the same base learning rate. The schedule is WSD: 2%
@@ -210,6 +213,8 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
     ple_dim = _ple_dim(os.environ.get("PLE_DIM", str(_PLE_DIM)))
     arch = os.environ.get("ARCH", "ffn")
     qmlp_ratio = float(os.environ.get("QMLP_RATIO", "1.375"))
+    qmlp_intermediate_env = os.environ.get("QMLP_INTERMEDIATE")
+    qmlp_swa_per_full = int(os.environ.get("QMLP_SWA_PER_FULL", "5"))
     use_fp8 = os.environ.get("FP8", "1") != "0"
     converters = []
     if use_fp8:
@@ -230,6 +235,10 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
         tokenizer_path=os.path.join(tokenizer_dir, "tokenizer.json"),
         arch=arch,
         qmlp_ratio=qmlp_ratio,
+        qmlp_intermediate=(
+            None if qmlp_intermediate_env is None else int(qmlp_intermediate_env)
+        ),
+        qmlp_swa_per_full=qmlp_swa_per_full,
     )
     model_config.ple_async_training = ple_async_training
     model_config.ple_unbind_inputs = unbind_flag == "1"

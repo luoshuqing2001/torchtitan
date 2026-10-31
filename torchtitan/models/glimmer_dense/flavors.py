@@ -32,6 +32,13 @@ model has half as many blocks. Each sliding-window layer's query projection
 becomes a GELU MLP of width ``qmlp_ratio * dim`` (``qmlp.py``); global layers
 keep a linear query. The default ratio 1.375 follows SMLA-4x
 (i_Q / hidden = 2432 / 1792).
+
+``arch="qmlpdeep"`` keeps the dense model's number of global (NoPE) layers,
+L / 4, and puts ``qmlp_swa_per_full`` (default 5) sliding-window layers before
+each, so the default has 1.5 L attention layers and no FFN. Global layers sit
+at the same relative depths as in the dense model. The query MLP width is
+``qmlp_intermediate`` (default 2 * dim), which leaves the model about 28% fewer
+non-embedding parameters and 14-22% fewer training FLOPs than the dense flavor.
 """
 
 from collections.abc import Callable
@@ -44,13 +51,14 @@ from torchtitan.config.transform import (
     ModelConfigConverter,
     validate_converter_compatibility,
 )
-from torchtitan.models.common import Embedding, Linear
+from torchtitan.models.common import ComplexRoPE, Embedding, Linear
 from torchtitan.models.common.config_utils import make_ffn_config
 from torchtitan.models.muse_glimmer.flavors import (
     _build_muse_glimmer_attention,
     _depth_init,
     _gain_norm,
     _LINEAR_INIT,
+    _ROPE_THETA,
 )
 from torchtitan.models.muse_glimmer.model import RMSGainCenterNorm
 
@@ -88,8 +96,10 @@ _WINDOW_PATTERN = [512, 512, 512, 0]
 _NORM_EPS = 1e-5
 _POST_NORM_EPS = 1e-8
 _MAX_CONTEXT_LENGTH = 2048
-ARCHS = ("ffn", "qmlp")
+ARCHS = ("ffn", "qmlp", "qmlpdeep")
 _QMLP_RATIO = 1.375
+_QMLP_SWA_PER_FULL = 5
+_QMLPDEEP_RATIO = 2
 
 # (dim, n_layers). Heads are dim / 64; KV heads are heads / 4.
 _FLAVOR_SHAPES: dict[str, tuple[int, int]] = {
@@ -300,16 +310,58 @@ def _flavor_config(
     tokenizer_path: str | None = None,
     arch: str = "ffn",
     qmlp_ratio: float = _QMLP_RATIO,
+    qmlp_intermediate: int | None = None,
+    qmlp_swa_per_full: int = _QMLP_SWA_PER_FULL,
 ) -> GlimmerDenseModel.Config:
     n_heads = dim // _HEAD_DIM
     n_kv_heads = n_heads // 4
     hidden_dim = _FFN_MULTIPLIER * dim
+    if arch == "qmlpdeep":
+        n_layers = (n_layers // 4) * (qmlp_swa_per_full + 1)
     output_init = {
         "weight": _residual_output_weight_init(n_layers),
         "bias": nn.init.zeros_,
     }
     layers = []
     for layer_id in range(n_layers):
+        if arch == "qmlpdeep":
+            # One global layer closes every group of qmlp_swa_per_full + 1,
+            # counted back from the last layer like the dense iRoPE cycle.
+            full = (n_layers - 1 - layer_id) % (qmlp_swa_per_full + 1) == 0
+            attention = _build_muse_glimmer_attention(
+                layer_id=layer_id,
+                n_layers=n_layers,
+                dim=dim,
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                head_dim=_HEAD_DIM,
+                max_context_length=seq_len,
+                window_pattern=[0] if full else [_WINDOW_PATTERN[0]],
+                attn_backend=attn_backend,
+            )
+            # RoPE on every sliding-window layer, NoPE on every global layer.
+            attention.rope = (
+                None
+                if full
+                else ComplexRoPE.Config(
+                    dim=_HEAD_DIM, max_context_length=seq_len, theta=_ROPE_THETA
+                )
+            )
+            if not full:
+                assert qmlp_intermediate is not None
+                attention = _query_mlp_attention(
+                    attention, dim=dim, intermediate=qmlp_intermediate
+                )
+            layers.append(
+                GlimmerAttentionBlock.Config(
+                    attention_norm=_gain_norm(dim, _NORM_EPS, gain_center=1.0),
+                    post_attention_norm=_gain_norm(
+                        dim, _POST_NORM_EPS, gain_center=1.0
+                    ),
+                    attention=attention,
+                )
+            )
+            continue
         if arch == "qmlp":
             attention = _build_muse_glimmer_attention(
                 layer_id=layer_id,
@@ -411,6 +463,8 @@ def build_model_config(
     tokenizer_path: str | None = None,
     arch: str = "ffn",
     qmlp_ratio: float = _QMLP_RATIO,
+    qmlp_intermediate: int | None = None,
+    qmlp_swa_per_full: int = _QMLP_SWA_PER_FULL,
 ) -> GlimmerDenseModel.Config:
     dim, n_layers, max_context_len = MODEL_FLAVORS[flavor]
     context_len = seq_len or max_context_len
@@ -428,8 +482,10 @@ def build_model_config(
         raise ValueError(f"ple_dim must be one of {PLE_DIM_TIERS}, got {ple_dim}")
     if arch not in ARCHS:
         raise ValueError(f"arch must be one of {ARCHS}, got {arch!r}")
-    if arch == "qmlp" and memory != "none":
-        raise ValueError("arch='qmlp' supports memory='none' only")
+    if arch != "ffn" and memory != "none":
+        raise ValueError(f"arch={arch!r} supports memory='none' only")
+    if arch == "qmlpdeep" and qmlp_intermediate is None:
+        qmlp_intermediate = _QMLPDEEP_RATIO * dim
     config = _flavor_config(
         dim,
         n_layers,
@@ -440,6 +496,8 @@ def build_model_config(
         tokenizer_path=tokenizer_path,
         arch=arch,
         qmlp_ratio=qmlp_ratio,
+        qmlp_intermediate=qmlp_intermediate,
+        qmlp_swa_per_full=qmlp_swa_per_full,
     )
     if converters is not None:
         validate_converter_compatibility(converters)

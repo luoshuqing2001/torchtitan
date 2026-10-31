@@ -96,3 +96,58 @@ def test_qmlp_matrices_use_muon():
             continue
         assert re.search(_MUON_PATTERN, name), name
         assert name in layouts, name
+
+
+@pytest.mark.parametrize(
+    "flavor,expected", [("d200m", 216_044_544), ("d400m", 364_442_880)]
+)
+def test_qmlpdeep_parameter_count(flavor, expected):
+    model = _meta_model(flavor, "qmlpdeep")
+    assert sum(p.numel() for p in model.parameters()) == expected
+
+
+def test_qmlpdeep_layout_keeps_global_layers_at_dense_depths():
+    model = _meta_model("d200m", "qmlpdeep")
+    assert len(model.layers) == 18
+    full_layers = []
+    for index, layer in enumerate(model.layers.values()):
+        attention = layer.attention
+        assert not hasattr(layer, "feed_forward")
+        swa = attention.window_size is not None
+        assert (attention.rope is not None) == swa
+        assert hasattr(attention.qkv_linear, "q_up") == swa
+        if swa:
+            assert attention.window_size == 512
+            assert attention.qkv_linear.q_up.weight.shape == (2048, 1024)
+        else:
+            full_layers.append(index)
+    # Dense d200m has its 3 global layers at 4/12, 8/12, 12/12 of the depth.
+    assert full_layers == [5, 11, 17]
+
+
+def test_qmlpdeep_init_std():
+    torch.manual_seed(0)
+    model = build_model_config("d200m", arch="qmlpdeep").build()
+    model.init_states()
+    qkv = model.layers["0"].attention.qkv_linear
+    assert qkv.q_up.weight.std().item() == pytest.approx(
+        GELU_GAIN / math.sqrt(1024), rel=0.02
+    )
+    assert qkv.q_down.weight.std().item() == pytest.approx(
+        1 / math.sqrt(2048), rel=0.02
+    )
+
+
+def test_qmlpdeep_matrices_use_muon():
+    config = build_model_config("d200m", arch="qmlpdeep")
+    optimizer = glimmer_muon_optimizer(
+        config, lr=4e-4, parallelism=ParallelismConfig()
+    )
+    layouts = optimizer.optimizers[0].compute_sharding_by_fqn
+    with torch.device("meta"):
+        model = config.build()
+    for name, parameter in model.named_parameters():
+        if not name.startswith("layers.") or parameter.ndim != 2:
+            continue
+        assert re.search(_MUON_PATTERN, name), name
+        assert name in layouts, name
