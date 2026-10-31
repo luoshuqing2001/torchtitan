@@ -1,0 +1,4 @@
+# qmlpdeep at d200m, 7 SWA layers per global layer, query MLP 1.75 x dim (1792): 5.4% fewer parameters
+# and 1.1% fewer training FLOPs than d200m_dense. 2 GPUs reading exactly the 4-GPU data (DATA_SHARDS=4),
+# one microbatch per step, d200m_dense recipe: LR 4e-4, 9922 steps.
+d200m 0 128 ARCH=qmlpdeep QMLP_SWA_PER_FULL=7 QMLP_INTERMEDIATE=1792 TRAIN_STEPS=9922 DATA_SHARDS=4 RUN_TAG=s7q1792ds4
