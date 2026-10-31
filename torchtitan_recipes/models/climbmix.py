@@ -59,6 +59,7 @@ def climbmix_validator(
     microbatch_tokens: int | None = None,
     val_every_tokens: int = _VAL_EVERY_TOKENS,
     num_data_shards: int | None = None,
+    data_shard_tokens: int | None = None,
 ) -> Validator.Config:
     """Validation cadence scaled to the training step's token count.
 
@@ -88,5 +89,6 @@ def climbmix_validator(
         dataloader=GrainDataLoader.Config(
             dataset=ConcatThenSplitPackingConfig(dataset=climbmix_dataset(val_files)),
             num_data_shards=num_data_shards,
+            data_shard_tokens=data_shard_tokens,
         ),
     )

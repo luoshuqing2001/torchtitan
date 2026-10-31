@@ -151,3 +151,42 @@ def test_qmlpdeep_matrices_use_muon():
             continue
         assert re.search(_MUON_PATTERN, name), name
         assert name in layouts, name
+
+
+@pytest.mark.parametrize(
+    "flavor,heads", [("d200m", 8), ("d400m", 12), ("d700m", 16), ("d1b", 20)]
+)
+def test_head_dim_128_heads_and_gqa(flavor, heads):
+    with torch.device("meta"):
+        model = build_model_config(flavor, head_dim=128).build()
+    attention = model.layers["0"].attention
+    assert attention.head_dim == 128
+    assert attention.n_heads == heads
+    assert attention.n_kv_heads == heads // 4
+    assert attention.o_gate.weight.shape[0] == heads * 128
+    assert attention.wo.weight.shape[1] == heads * 128
+
+
+def test_head_dim_128_d200m_matches_head_dim_64_size():
+    with torch.device("meta"):
+        a = build_model_config("d200m", head_dim=128).build()
+        b = build_model_config("d200m").build()
+    assert sum(p.numel() for p in a.parameters()) == sum(
+        p.numel() for p in b.parameters()
+    )
+
+
+def test_head_dim_128_qmlpdeep_queries_match_heads():
+    with torch.device("meta"):
+        model = build_model_config(
+            "d400m",
+            arch="qmlpdeep",
+            head_dim=128,
+            qmlp_swa_per_full=7,
+            qmlp_intermediate=1760,
+        ).build()
+    assert len(model.layers) == 32
+    qkv = model.layers["0"].attention.qkv_linear
+    assert qkv.q_up.weight.shape == (1760, 1280)
+    assert qkv.q_down.weight.shape == (12 * 128, 1760)
+    assert qkv.wkv.weight.shape == (2 * 3 * 128, 1280)

@@ -83,12 +83,19 @@ class GrainDataLoader(BaseDataLoader):
         """Shard the data as if there were this many data-parallel ranks.
 
         Each rank reads ``num_data_shards / dp_world_size`` virtual shards
-        (ranks ``dp_rank + j * dp_world_size``) and concatenates their
-        microbatches along the token dimension. Packing starts every row at
-        position 0, so the concatenation adds a document boundary and the step
-        sees exactly the tokens a ``num_data_shards``-rank run sees. The
-        checkpoint state uses that run's format.
+        (ranks ``dp_rank + j * dp_world_size``). Every microbatch concatenates
+        whole microbatches of ``num_tokens_per_microbatch / data_shard_tokens``
+        consecutive virtual shards along the token dimension, cycling through
+        them, so gradient accumulation visits each shard once per step. Packing
+        starts every row at position 0, so a concatenation adds a document
+        boundary and the step sees exactly the tokens a
+        ``num_data_shards``-rank run sees. The checkpoint state uses that run's
+        format.
         """
+        data_shard_tokens: int | None = None
+        """Tokens in one virtual shard's microbatch, i.e. the per-rank
+        microbatch of the ``num_data_shards``-rank run being reproduced. ``None``
+        concatenates all of a rank's shards into every microbatch."""
 
     def __init__(
         self,
@@ -125,14 +132,24 @@ class GrainDataLoader(BaseDataLoader):
                     f"dp_world_size={dp_world_size}"
                 )
             per_rank = shards // dp_world_size
-            if num_tokens_per_microbatch % per_rank != 0:
+            shard_tokens = config.data_shard_tokens or (
+                num_tokens_per_microbatch // per_rank
+            )
+            per_microbatch = num_tokens_per_microbatch // shard_tokens
+            if (
+                num_tokens_per_microbatch % shard_tokens != 0
+                or per_rank % per_microbatch != 0
+            ):
                 raise ValueError(
                     f"num_tokens_per_microbatch={num_tokens_per_microbatch} must "
-                    f"split evenly over {per_rank} virtual shards"
+                    f"hold a whole number of {shard_tokens}-token shard "
+                    f"microbatches that divides the {per_rank} shards of a rank"
                 )
             if config.max_num_documents is not None:
                 raise ValueError("num_data_shards does not support max_num_documents")
-            child_config = replace(config, num_data_shards=None)
+            child_config = replace(
+                config, num_data_shards=None, data_shard_tokens=None
+            )
             self._dp_world_size = shards
             self._children = [
                 GrainDataLoader(
@@ -141,11 +158,11 @@ class GrainDataLoader(BaseDataLoader):
                     dp_rank=dp_rank + j * dp_world_size,
                     tokenizer=tokenizer,
                     max_context_length=max_context_length,
-                    num_tokens_per_microbatch=num_tokens_per_microbatch // per_rank,
+                    num_tokens_per_microbatch=shard_tokens,
                 )
                 for j in range(per_rank)
             ]
-            self._iterator = self._concat_children()
+            self._iterator = self._concat_children(per_microbatch)
             return
 
         # Build the dataset graph and collator.
@@ -195,10 +212,16 @@ class GrainDataLoader(BaseDataLoader):
         )
         self._iterator = iter(dataset)
 
-    def _concat_children(self) -> Iterator[TrainingMicrobatch]:
+    def _concat_children(self, per_microbatch: int) -> Iterator[TrainingMicrobatch]:
         iterators = [iter(child) for child in self._children]
+        groups = [
+            iterators[start : start + per_microbatch]
+            for start in range(0, len(iterators), per_microbatch)
+        ]
+        index = 0
         while True:
-            parts = [next(iterator) for iterator in iterators]
+            parts = [next(iterator) for iterator in groups[index]]
+            index = (index + 1) % len(groups)
             for part in parts:
                 if not isinstance(part, TokenizedTrainingMicrobatch) or part.model_kwargs:
                     raise TypeError("num_data_shards supports plain token microbatches")

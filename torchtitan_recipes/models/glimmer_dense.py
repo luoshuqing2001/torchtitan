@@ -119,6 +119,7 @@ def _default_token_budget(
     *,
     seq_len: int | None,
     attn_backend: str,
+    head_dim: int = 64,
 ) -> int:
     """20 tokens per dense parameter at this flavor.
 
@@ -130,6 +131,7 @@ def _default_token_budget(
         seq_len=seq_len,
         attn_backend=attn_backend,
         memory="none",
+        head_dim=head_dim,
     )
     with torch.device("meta"):
         model = dense.build()
@@ -186,7 +188,8 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
     dense run at that flavor. ``ARCH=qmlpdeep`` keeps the dense model's
     global-layer count, puts ``QMLP_SWA_PER_FULL`` (default 5) sliding-window
     layers before each, and uses query MLP width ``QMLP_INTERMEDIATE``
-    (default 2 * dim).
+    (default 2 * dim). ``HEAD_DIM=128`` uses 128-dim heads with 8 / 12 / 16 / 20
+    query heads (GQA 4:1) at the same hidden sizes and depths.
 
     Matrix parameters use Moonlight Muon. Embeddings, norms, and the LM head
     stay on AdamW at the same base learning rate. The schedule is WSD: 2%
@@ -215,6 +218,7 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
     qmlp_ratio = float(os.environ.get("QMLP_RATIO", "1.375"))
     qmlp_intermediate_env = os.environ.get("QMLP_INTERMEDIATE")
     qmlp_swa_per_full = int(os.environ.get("QMLP_SWA_PER_FULL", "5"))
+    head_dim = int(os.environ.get("HEAD_DIM", "64"))
     use_fp8 = os.environ.get("FP8", "1") != "0"
     converters = []
     if use_fp8:
@@ -239,6 +243,7 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
             None if qmlp_intermediate_env is None else int(qmlp_intermediate_env)
         ),
         qmlp_swa_per_full=qmlp_swa_per_full,
+        head_dim=head_dim,
     )
     model_config.ple_async_training = ple_async_training
     model_config.ple_unbind_inputs = unbind_flag == "1"
@@ -268,15 +273,20 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
             f"GLOBAL_BATCH_TOKENS={global_tokens_per_step} is not a multiple of "
             f"LOCAL_BATCH_SIZE * seq_len * NGPU = {microbatch_tokens}"
         )
-    # DATA_SHARDS=4 makes a 2-GPU run read exactly the data of the 4-GPU ladder
-    # runs, step by step, for training and validation. It needs one microbatch
-    # per step so each step concatenates whole virtual-rank microbatches.
+    # DATA_SHARDS=4 makes a run on fewer GPUs read exactly the data of the
+    # 4-GPU ladder runs, step by step, for training and validation. Each
+    # per-GPU microbatch must hold whole virtual-shard microbatches
+    # (GLOBAL_BATCH_TOKENS / DATA_SHARDS tokens each).
     data_shards_env = os.environ.get("DATA_SHARDS")
     data_shards = None if data_shards_env is None else int(data_shards_env)
-    if data_shards is not None and global_tokens_per_step != microbatch_tokens:
+    data_shard_tokens = (
+        None if data_shards is None else global_tokens_per_step // data_shards
+    )
+    local_tokens = local_batch * model_config.max_context_length
+    if data_shards is not None and local_tokens % data_shard_tokens != 0:
         raise ValueError(
-            "DATA_SHARDS needs gradient accumulation 1: set LOCAL_BATCH_SIZE so "
-            f"LOCAL_BATCH_SIZE * seq_len * NGPU = {global_tokens_per_step}"
+            f"DATA_SHARDS={data_shards}: LOCAL_BATCH_SIZE * seq_len = {local_tokens} "
+            f"must be a multiple of the shard microbatch {data_shard_tokens}"
         )
     if _VAL_EVERY_TOKENS % global_tokens_per_step != 0:
         raise ValueError(
@@ -295,6 +305,7 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
                         flavor,
                         seq_len=seq_len,
                         attn_backend=attn_backend,
+                        head_dim=head_dim,
                     )
                 ),
             )
@@ -354,6 +365,7 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
         dataloader=GrainDataLoader.Config(
             dataset=ConcatThenSplitPackingConfig(dataset=dataset),
             num_data_shards=data_shards,
+            data_shard_tokens=data_shard_tokens,
         ),
         parallelism=parallelism,
         optim=Optim.Config(
@@ -378,6 +390,7 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
             microbatch_tokens=microbatch_tokens,
             val_every_tokens=_VAL_EVERY_TOKENS,
             num_data_shards=data_shards,
+            data_shard_tokens=data_shard_tokens,
         ),
         checkpointer=CheckpointManager.Config(
             interval=_VAL_EVERY_TOKENS // global_tokens_per_step,

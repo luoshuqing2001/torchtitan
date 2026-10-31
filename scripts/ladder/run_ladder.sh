@@ -32,7 +32,9 @@ TITAN_VENV="${TITAN_VENV:-${HOME}/titan-venv}"
 R2_ENV="${R2_ENV:-${HOME}/r2-credentials.env}"
 R2_DEST="${R2_DEST:-r2:physiofm-shards/lsq_dev/torchtitan-ladder}"
 RCLONE="${RCLONE:-$(command -v rclone || echo "${HOME}/rclone-v1.75.2-linux-amd64/rclone")}"
-STAGE="${HOME}/ladder_sync_stage"
+# Runners sharing a node need their own stage dir (LADDER_STAGE) and must not
+# wait for each other's training (LADDER_NO_WAIT=1).
+STAGE="${LADDER_STAGE:-${HOME}/ladder_sync_stage}"
 
 export PYTHONPATH="${ROOT}" PYTHONUNBUFFERED=1 PYTORCH_ALLOC_CONF=expandable_segments:True
 export NGPU="${NGPU:-4}" LOG_FREQ="${LOG_FREQ:-10}" PLE_ASYNC_TRAINING=0 CKPT_KEEP=2 LOG_RANK=0
@@ -113,7 +115,7 @@ train() {  # flavor variant micro out extra_env...
 # A training process left by an earlier runner keeps the GPUs; wait for it and
 # keep uploading its snapshots instead of starting a second job.
 waits=0
-while pgrep -f "[t]orchtitan.train" > /dev/null; do
+while [[ "${LADDER_NO_WAIT:-0}" != 1 ]] && pgrep -f "[t]orchtitan.train" > /dev/null; do
   sleep 30; waits=$((waits + 1))
   if (( waits % 10 == 0 )); then
     for out in outputs/ladder/*/; do upload_snapshots ${out%/}; done

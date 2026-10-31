@@ -91,6 +91,11 @@ _EMBEDDING_INIT = {"weight": partial(nn.init.normal_, std=0.02)}
 _VOCAB_SIZE = 100352
 _EOS_TOKEN_ID = 100257
 _HEAD_DIM = 64
+# head_dim=128 keeps the hidden sizes and depths but uses 128-dim heads with
+# 8 / 12 / 16 / 20 query heads, so every flavor keeps GQA 4:1 with whole KV
+# heads. The query/output width (heads * 128) is then decoupled from dim.
+HEAD_DIMS = (64, 128)
+_N_HEADS_AT_128 = {1024: 8, 1280: 12, 1536: 16, 2048: 20}
 _FFN_MULTIPLIER = 3
 _WINDOW_PATTERN = [512, 512, 512, 0]
 _NORM_EPS = 1e-5
@@ -312,8 +317,9 @@ def _flavor_config(
     qmlp_ratio: float = _QMLP_RATIO,
     qmlp_intermediate: int | None = None,
     qmlp_swa_per_full: int = _QMLP_SWA_PER_FULL,
+    head_dim: int = _HEAD_DIM,
 ) -> GlimmerDenseModel.Config:
-    n_heads = dim // _HEAD_DIM
+    n_heads = dim // head_dim if head_dim == _HEAD_DIM else _N_HEADS_AT_128[dim]
     n_kv_heads = n_heads // 4
     hidden_dim = _FFN_MULTIPLIER * dim
     if arch == "qmlpdeep":
@@ -334,7 +340,7 @@ def _flavor_config(
                 dim=dim,
                 n_heads=n_heads,
                 n_kv_heads=n_kv_heads,
-                head_dim=_HEAD_DIM,
+                head_dim=head_dim,
                 max_context_length=seq_len,
                 window_pattern=[0] if full else [_WINDOW_PATTERN[0]],
                 attn_backend=attn_backend,
@@ -344,7 +350,7 @@ def _flavor_config(
                 None
                 if full
                 else ComplexRoPE.Config(
-                    dim=_HEAD_DIM, max_context_length=seq_len, theta=_ROPE_THETA
+                    dim=head_dim, max_context_length=seq_len, theta=_ROPE_THETA
                 )
             )
             if not full:
@@ -369,7 +375,7 @@ def _flavor_config(
                 dim=dim,
                 n_heads=n_heads,
                 n_kv_heads=n_kv_heads,
-                head_dim=_HEAD_DIM,
+                head_dim=head_dim,
                 max_context_length=seq_len,
                 window_pattern=_WINDOW_PATTERN,
                 attn_backend=attn_backend,
@@ -400,7 +406,7 @@ def _flavor_config(
                     dim=dim,
                     n_heads=n_heads,
                     n_kv_heads=n_kv_heads,
-                    head_dim=_HEAD_DIM,
+                    head_dim=head_dim,
                     max_context_length=seq_len,
                     window_pattern=_WINDOW_PATTERN,
                     attn_backend=attn_backend,
@@ -465,6 +471,7 @@ def build_model_config(
     qmlp_ratio: float = _QMLP_RATIO,
     qmlp_intermediate: int | None = None,
     qmlp_swa_per_full: int = _QMLP_SWA_PER_FULL,
+    head_dim: int = _HEAD_DIM,
 ) -> GlimmerDenseModel.Config:
     dim, n_layers, max_context_len = MODEL_FLAVORS[flavor]
     context_len = seq_len or max_context_len
@@ -480,6 +487,8 @@ def build_model_config(
         )
     if ple_dim not in PLE_DIM_TIERS:
         raise ValueError(f"ple_dim must be one of {PLE_DIM_TIERS}, got {ple_dim}")
+    if head_dim not in HEAD_DIMS:
+        raise ValueError(f"head_dim must be one of {HEAD_DIMS}, got {head_dim}")
     if arch not in ARCHS:
         raise ValueError(f"arch must be one of {ARCHS}, got {arch!r}")
     if arch != "ffn" and memory != "none":
@@ -498,6 +507,7 @@ def build_model_config(
         qmlp_ratio=qmlp_ratio,
         qmlp_intermediate=qmlp_intermediate,
         qmlp_swa_per_full=qmlp_swa_per_full,
+        head_dim=head_dim,
     )
     if converters is not None:
         validate_converter_compatibility(converters)
