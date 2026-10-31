@@ -26,7 +26,8 @@ from torchtitan.models.common.attention import (
     get_sliding_window_mask_mod,
     VarlenInnerAttention,
 )
-from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.muse_glimmer.model import (
     _window_mask_key,
     Attention,
@@ -80,6 +81,46 @@ class GlimmerDenseBlock(MuseGlimmerTransformerBlock):
         if self.layer_ple is None or per_layer_input is None:
             return out
         return self.layer_ple(out, per_layer_input, staged=staged)
+
+
+class GlimmerAttentionBlock(TransformerBlock):
+    """Post-norm Glimmer block with attention only (no FFN).
+
+    ``out = x + post_attention_norm(attn(attention_norm(x)))``
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(TransformerBlock.Config):
+        ffn_norm: RMSNorm.Config | None = None
+        post_attention_norm: RMSNorm.Config
+        # Read by GlimmerDenseModel for every layer; PLE is not supported here.
+        layer_ple: LayerPLE.Config | None = None
+
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        if config.feed_forward is not None or config.moe is not None:
+            raise ValueError("GlimmerAttentionBlock has no FFN")
+        if config.layer_ple is not None:
+            raise ValueError("GlimmerAttentionBlock does not support PLE")
+        self.attention = config.attention.build()
+        self.attention_norm = config.attention_norm.build()
+        self.post_attention_norm = config.post_attention_norm.build()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_masks: AttentionMasksType | None,
+        positions: torch.Tensor | None = None,
+        *,
+        padding_mask: torch.Tensor | None = None,
+        per_layer_input: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del padding_mask
+        if per_layer_input is not None:
+            raise ValueError("GlimmerAttentionBlock does not take PLE inputs")
+        return x + self.post_attention_norm(
+            self.attention(self.attention_norm(x), attention_masks, positions)
+        )
 
 
 class GlimmerDenseModel(Decoder):

@@ -137,8 +137,10 @@ def _default_token_budget(
     return _TOKENS_PER_PARAM * total
 
 
-def _dump_folder(flavor: str, memory: str, ple_dim: int) -> str:
+def _dump_folder(flavor: str, memory: str, ple_dim: int, arch: str = "ffn") -> str:
     # OLMo3 checkpoints stay out of the Qwen3.8 dump folders.
+    if arch != "ffn":
+        return f"./outputs/glimmer_dense_olmo3_{arch}/{flavor}"
     name = flavor if ple_dim == _PLE_DIM else f"{flavor}_ple{ple_dim}"
     if memory == "ple":
         return f"./outputs/glimmer_dense_olmo3_ple/{name}"
@@ -178,6 +180,11 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
     ``./outputs/glimmer_dense_olmo3_engram/<flavor>``. Wider tiers use
     ``<flavor>_ple<PLE_DIM>``.
 
+    ``ARCH=qmlp`` removes every FFN and makes each sliding-window layer's
+    query projection a GELU MLP of width ``QMLP_RATIO * dim`` (default 1.375).
+    It keeps the dense ladder's token budget, so it sees the same data as the
+    dense run at that flavor.
+
     Matrix parameters use Moonlight Muon. Embeddings, norms, and the LM head
     stay on AdamW at the same base learning rate. The schedule is WSD: 2%
     warmup, 88% at the peak, then 10% cosine decay to one tenth of the peak.
@@ -201,6 +208,8 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
     if unbind_flag == "1" and memory != "ple":
         raise ValueError("PLE_UNBIND_INPUTS=1 requires PLE=ple")
     ple_dim = _ple_dim(os.environ.get("PLE_DIM", str(_PLE_DIM)))
+    arch = os.environ.get("ARCH", "ffn")
+    qmlp_ratio = float(os.environ.get("QMLP_RATIO", "1.375"))
     use_fp8 = os.environ.get("FP8", "1") != "0"
     converters = []
     if use_fp8:
@@ -219,6 +228,8 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
         ple_dim=ple_dim,
         converters=converters or None,
         tokenizer_path=os.path.join(tokenizer_dir, "tokenizer.json"),
+        arch=arch,
+        qmlp_ratio=qmlp_ratio,
     )
     model_config.ple_async_training = ple_async_training
     model_config.ple_unbind_inputs = unbind_flag == "1"
@@ -308,7 +319,7 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
     return Trainer.Config(
         dump_folder=os.environ.get(
             "DUMP_FOLDER",
-            _dump_folder(flavor, memory, ple_dim),
+            _dump_folder(flavor, memory, ple_dim, arch),
         ),
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(

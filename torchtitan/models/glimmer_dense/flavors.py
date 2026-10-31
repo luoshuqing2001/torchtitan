@@ -26,6 +26,12 @@ engram_dram and engram_optim experiments.
 - ``d400m``: dim 1280, 16 layers, 20/5 heads, FFN 3840. 456,213,760.
 - ``d700m``: dim 1536, 20 layers, 24/6 heads, FFN 4608. 744,089,088.
 - ``d1b``: dim 2048, 24 layers, 32/8 heads, FFN 6144. 1,464,010,752.
+
+``arch="qmlp"`` keeps every attention layer and removes every FFN, so the
+model has half as many blocks. Each sliding-window layer's query projection
+becomes a GELU MLP of width ``qmlp_ratio * dim`` (``qmlp.py``); global layers
+keep a linear query. The default ratio 1.375 follows SMLA-4x
+(i_Q / hidden = 2432 / 1792).
 """
 
 from collections.abc import Callable
@@ -60,8 +66,9 @@ from .deepseek_engram import (
     NUM_HEADS,
 )
 from .engram import EngramTable, EngramUpdate, NGramEngram, rows_per_head_matching_ple
-from .model import GlimmerDenseBlock, GlimmerDenseModel
+from .model import GlimmerAttentionBlock, GlimmerDenseBlock, GlimmerDenseModel
 from .ple import _PLE_DIM, LayerPLE, PerLayerContext, PerLayerEmbedder, PLE_DIM_TIERS
+from .qmlp import query_mlp_param_init, QueryMLPKVLinear
 
 __all__ = [
     "MODEL_FLAVORS",
@@ -81,6 +88,8 @@ _WINDOW_PATTERN = [512, 512, 512, 0]
 _NORM_EPS = 1e-5
 _POST_NORM_EPS = 1e-8
 _MAX_CONTEXT_LENGTH = 2048
+ARCHS = ("ffn", "qmlp")
+_QMLP_RATIO = 1.375
 
 # (dim, n_layers). Heads are dim / 64; KV heads are heads / 4.
 _FLAVOR_SHAPES: dict[str, tuple[int, int]] = {
@@ -255,6 +264,31 @@ def _deepseek_engram_config(
     )
 
 
+def _query_mlp_attention(attention, *, dim: int, intermediate: int):
+    """Replace a sliding-window layer's fused QKV with a query MLP + linear KV."""
+    qkv = attention.qkv_linear
+    up_init, down_init = query_mlp_param_init(dim, intermediate)
+    attention.qkv_linear = QueryMLPKVLinear.Config(
+        head_dim=qkv.head_dim,
+        n_heads=qkv.n_heads,
+        n_kv_heads=qkv.n_kv_heads,
+        q_up=Linear.Config(
+            in_features=dim, out_features=intermediate, param_init=up_init
+        ),
+        q_down=Linear.Config(
+            in_features=intermediate,
+            out_features=qkv.n_heads * qkv.head_dim,
+            param_init=down_init,
+        ),
+        wkv=Linear.Config(
+            in_features=dim,
+            out_features=2 * qkv.n_kv_heads * qkv.head_dim,
+            param_init=_LINEAR_INIT,
+        ),
+    )
+    return attention
+
+
 def _flavor_config(
     dim: int,
     n_layers: int,
@@ -264,6 +298,8 @@ def _flavor_config(
     memory: str = "none",
     ple_dim: int = _PLE_DIM,
     tokenizer_path: str | None = None,
+    arch: str = "ffn",
+    qmlp_ratio: float = _QMLP_RATIO,
 ) -> GlimmerDenseModel.Config:
     n_heads = dim // _HEAD_DIM
     n_kv_heads = n_heads // 4
@@ -274,6 +310,32 @@ def _flavor_config(
     }
     layers = []
     for layer_id in range(n_layers):
+        if arch == "qmlp":
+            attention = _build_muse_glimmer_attention(
+                layer_id=layer_id,
+                n_layers=n_layers,
+                dim=dim,
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                head_dim=_HEAD_DIM,
+                max_context_length=seq_len,
+                window_pattern=_WINDOW_PATTERN,
+                attn_backend=attn_backend,
+            )
+            if attention.window_size is not None:
+                attention = _query_mlp_attention(
+                    attention, dim=dim, intermediate=round(qmlp_ratio * dim)
+                )
+            layers.append(
+                GlimmerAttentionBlock.Config(
+                    attention_norm=_gain_norm(dim, _NORM_EPS, gain_center=1.0),
+                    post_attention_norm=_gain_norm(
+                        dim, _POST_NORM_EPS, gain_center=1.0
+                    ),
+                    attention=attention,
+                )
+            )
+            continue
         layers.append(
             GlimmerDenseBlock.Config(
                 attention_norm=_gain_norm(dim, _NORM_EPS, gain_center=1.0),
@@ -347,6 +409,8 @@ def build_model_config(
     ple_dim: int = _PLE_DIM,
     converters: list[ModelConfigConverter.Config] | None = None,
     tokenizer_path: str | None = None,
+    arch: str = "ffn",
+    qmlp_ratio: float = _QMLP_RATIO,
 ) -> GlimmerDenseModel.Config:
     dim, n_layers, max_context_len = MODEL_FLAVORS[flavor]
     context_len = seq_len or max_context_len
@@ -362,6 +426,10 @@ def build_model_config(
         )
     if ple_dim not in PLE_DIM_TIERS:
         raise ValueError(f"ple_dim must be one of {PLE_DIM_TIERS}, got {ple_dim}")
+    if arch not in ARCHS:
+        raise ValueError(f"arch must be one of {ARCHS}, got {arch!r}")
+    if arch == "qmlp" and memory != "none":
+        raise ValueError("arch='qmlp' supports memory='none' only")
     config = _flavor_config(
         dim,
         n_layers,
@@ -370,6 +438,8 @@ def build_model_config(
         memory=memory,
         ple_dim=ple_dim,
         tokenizer_path=tokenizer_path,
+        arch=arch,
+        qmlp_ratio=qmlp_ratio,
     )
     if converters is not None:
         validate_converter_compatibility(converters)

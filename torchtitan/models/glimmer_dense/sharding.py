@@ -9,10 +9,15 @@ from typing import TYPE_CHECKING
 import spmd_types as spmd
 
 from torchtitan.models.common.decoder_sharding import (
+    attention_activation_placement,
+    colwise_config,
     dense_activation_placement,
     dense_param_placement,
     dense_sequence_parallel_placement,
+    norm_config,
+    rowwise_config,
     set_decoder_sharding_config,
+    set_gqa_inner_attention_local_spmd,
     token_id_placement,
 )
 from torchtitan.models.muse_glimmer.sharding import _set_muse_glimmer_layer_sharding
@@ -28,9 +33,14 @@ def set_glimmer_dense_sharding_config(
     enable_sp: bool,
 ) -> None:
     """Fill sharding configs for Muse Glimmer attention and a dense SwiGLU."""
+    from .model import GlimmerAttentionBlock
+
     set_decoder_sharding_config(config, enable_sp=enable_sp)
     for layer_cfg in config.layers:
-        _set_muse_glimmer_layer_sharding(layer_cfg, enable_sp=enable_sp)
+        if isinstance(layer_cfg, GlimmerAttentionBlock.Config):
+            _set_attention_only_layer_sharding(layer_cfg, enable_sp=enable_sp)
+        else:
+            _set_muse_glimmer_layer_sharding(layer_cfg, enable_sp=enable_sp)
     if config.ple is not None and not config.ple_async_training:
         _set_ple_sharding(config.ple, enable_sp=enable_sp)
         for layer_cfg in config.layers:
@@ -41,6 +51,46 @@ def set_glimmer_dense_sharding_config(
     if config.deepseek_engram is not None:
         for layer in config.deepseek_engram.layers.values():
             _set_deepseek_engram_sharding(layer, enable_sp=enable_sp)
+
+
+def _set_attention_only_layer_sharding(layer_cfg, *, enable_sp: bool) -> None:
+    """Muse Glimmer layer sharding without the FFN, for ``arch='qmlp'``.
+
+    The query MLP and fused KV are placed like ``wqkv``. The recipe runs them
+    with tensor parallel degree 1 (DistMuon requires it), so only FSDP applies.
+    """
+    from .qmlp import QueryMLPKVLinear
+
+    attention = layer_cfg.attention
+    x_layout = _activation_layout(enable_sp=enable_sp)
+    layer_cfg.attention_norm.sharding_config = ShardingConfig(
+        state_shardings={
+            "weight": dense_param_placement(tp=spmd.R if enable_sp else spmd.I)
+        },
+        in_src_shardings={"input": x_layout},
+        out_src_shardings=x_layout,
+    )
+    layer_cfg.post_attention_norm.sharding_config = norm_config(enable_sp=enable_sp)
+    attention.sharding_config = ShardingConfig(in_src_shardings={"x_TD": x_layout})
+    gathered = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+    qkv = attention.qkv_linear
+    if isinstance(qkv, QueryMLPKVLinear.Config):
+        for linear in (qkv.q_up, qkv.q_down, qkv.wkv):
+            linear.sharding_config = colwise_config(input_layout=gathered)
+    else:
+        qkv.wqkv.sharding_config = colwise_config(input_layout=gathered)
+    attention.wo.sharding_config = rowwise_config(output_layout=x_layout)
+    set_gqa_inner_attention_local_spmd(attention.inner_attention)
+    if attention.qk_norm is not None:
+        head_shard = attention_activation_placement()
+        attention.qk_norm.sharding_config = ShardingConfig(
+            in_src_shardings={"input": head_shard},
+            in_dst_shardings={"input": head_shard},
+            out_src_shardings=head_shard,
+            out_dst_shardings=head_shard,
+        )
+    if attention.o_gate is not None:
+        attention.o_gate.sharding_config = colwise_config(input_layout=gathered)
 
 
 def _activation_layout(*, enable_sp: bool):
