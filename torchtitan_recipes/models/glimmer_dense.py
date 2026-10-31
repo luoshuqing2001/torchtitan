@@ -268,6 +268,16 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
             f"GLOBAL_BATCH_TOKENS={global_tokens_per_step} is not a multiple of "
             f"LOCAL_BATCH_SIZE * seq_len * NGPU = {microbatch_tokens}"
         )
+    # DATA_SHARDS=4 makes a 2-GPU run read exactly the data of the 4-GPU ladder
+    # runs, step by step, for training and validation. It needs one microbatch
+    # per step so each step concatenates whole virtual-rank microbatches.
+    data_shards_env = os.environ.get("DATA_SHARDS")
+    data_shards = None if data_shards_env is None else int(data_shards_env)
+    if data_shards is not None and global_tokens_per_step != microbatch_tokens:
+        raise ValueError(
+            "DATA_SHARDS needs gradient accumulation 1: set LOCAL_BATCH_SIZE so "
+            f"LOCAL_BATCH_SIZE * seq_len * NGPU = {global_tokens_per_step}"
+        )
     if _VAL_EVERY_TOKENS % global_tokens_per_step != 0:
         raise ValueError(
             f"GLOBAL_BATCH_TOKENS={global_tokens_per_step} must divide "
@@ -343,6 +353,7 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
         model=model_config,
         dataloader=GrainDataLoader.Config(
             dataset=ConcatThenSplitPackingConfig(dataset=dataset),
+            num_data_shards=data_shards,
         ),
         parallelism=parallelism,
         optim=Optim.Config(
@@ -366,6 +377,7 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
             global_tokens_per_step=global_tokens_per_step,
             microbatch_tokens=microbatch_tokens,
             val_every_tokens=_VAL_EVERY_TOKENS,
+            num_data_shards=data_shards,
         ),
         checkpointer=CheckpointManager.Config(
             interval=_VAL_EVERY_TOKENS // global_tokens_per_step,

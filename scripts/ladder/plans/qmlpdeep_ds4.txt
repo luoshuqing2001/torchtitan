@@ -1,0 +1,3 @@
+# qmlpdeep at d200m on 2 GPUs reading exactly the 4-GPU ladder data (DATA_SHARDS=4),
+# one microbatch per step (128 x 2048 tokens per GPU), d200m_dense recipe: LR 4e-4, 9922 steps.
+d200m 0 128 ARCH=qmlpdeep TRAIN_STEPS=9922 DATA_SHARDS=4 RUN_TAG=ds4

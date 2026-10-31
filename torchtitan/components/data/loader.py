@@ -8,10 +8,11 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import grain.python as grain
+import torch
 from grain import experimental as grain_experimental
 from torch.distributed.checkpoint.stateful import Stateful
 
@@ -20,6 +21,7 @@ from torchtitan.components.data.dataset import DatasetConfig
 from torchtitan.components.data.types import (
     DatasetBuildContext,
     DatasetIterationPolicy,
+    TokenizedTrainingMicrobatch,
     TrainingMicrobatch,
 )
 from torchtitan.components.tokenizer import BaseTokenizer
@@ -77,6 +79,16 @@ class GrainDataLoader(BaseDataLoader):
         """Concurrent indexed reads used when a `MapDataset` becomes an `IterDataset`."""
         num_prefetch_microbatches: int = 2
         """Collated microbatches queued per rank for trainer consumption."""
+        num_data_shards: int | None = None
+        """Shard the data as if there were this many data-parallel ranks.
+
+        Each rank reads ``num_data_shards / dp_world_size`` virtual shards
+        (ranks ``dp_rank + j * dp_world_size``) and concatenates their
+        microbatches along the token dimension. Packing starts every row at
+        position 0, so the concatenation adds a document boundary and the step
+        sees exactly the tokens a ``num_data_shards``-rank run sees. The
+        checkpoint state uses that run's format.
+        """
 
     def __init__(
         self,
@@ -104,6 +116,37 @@ class GrainDataLoader(BaseDataLoader):
         self._dp_world_size = dp_world_size
         self._rank_id = f"dp_rank_{dp_rank}"
         self.max_num_documents = config.max_num_documents
+        self._children: list[GrainDataLoader] = []
+        shards = config.num_data_shards
+        if shards is not None and shards != dp_world_size:
+            if shards % dp_world_size != 0:
+                raise ValueError(
+                    f"num_data_shards={shards} must be a multiple of "
+                    f"dp_world_size={dp_world_size}"
+                )
+            per_rank = shards // dp_world_size
+            if num_tokens_per_microbatch % per_rank != 0:
+                raise ValueError(
+                    f"num_tokens_per_microbatch={num_tokens_per_microbatch} must "
+                    f"split evenly over {per_rank} virtual shards"
+                )
+            if config.max_num_documents is not None:
+                raise ValueError("num_data_shards does not support max_num_documents")
+            child_config = replace(config, num_data_shards=None)
+            self._dp_world_size = shards
+            self._children = [
+                GrainDataLoader(
+                    child_config,
+                    dp_world_size=shards,
+                    dp_rank=dp_rank + j * dp_world_size,
+                    tokenizer=tokenizer,
+                    max_context_length=max_context_length,
+                    num_tokens_per_microbatch=num_tokens_per_microbatch // per_rank,
+                )
+                for j in range(per_rank)
+            ]
+            self._iterator = self._concat_children()
+            return
 
         # Build the dataset graph and collator.
         read_options = config.read_options
@@ -152,10 +195,30 @@ class GrainDataLoader(BaseDataLoader):
         )
         self._iterator = iter(dataset)
 
+    def _concat_children(self) -> Iterator[TrainingMicrobatch]:
+        iterators = [iter(child) for child in self._children]
+        while True:
+            parts = [next(iterator) for iterator in iterators]
+            for part in parts:
+                if not isinstance(part, TokenizedTrainingMicrobatch) or part.model_kwargs:
+                    raise TypeError("num_data_shards supports plain token microbatches")
+            yield TokenizedTrainingMicrobatch(
+                input=_pinned_cat([part.input for part in parts]),
+                labels=_pinned_cat([part.labels for part in parts]),
+                positions=_pinned_cat([part.positions for part in parts]),
+                padding_mask=_pinned_cat([part.padding_mask for part in parts]),
+                num_valid_tokens=sum(part.num_valid_tokens for part in parts),
+            )
+
     def __iter__(self) -> Iterator[TrainingMicrobatch]:
         return self._iterator
 
     def state_dict(self) -> dict[str, Any]:
+        if self._children:
+            state: dict[str, Any] = {"version": 1, "dp_world_size": self._dp_world_size}
+            for child in self._children:
+                state[child._rank_id] = child._iterator.get_state()
+            return state
         return {
             "version": 1,
             "dp_world_size": self._dp_world_size,
@@ -173,6 +236,10 @@ class GrainDataLoader(BaseDataLoader):
             raise ValueError(
                 "cannot resume after changing the effective data-parallel degree"
             )
+        if self._children:
+            for child in self._children:
+                child.load_state_dict(state_dict)
+            return
         if self._rank_id not in state_dict:
             raise ValueError(
                 f"checkpoint is missing dataloader state for {self._rank_id}"
@@ -184,4 +251,18 @@ class GrainDataLoader(BaseDataLoader):
             raise
 
     def close(self) -> None:
+        if self._children:
+            for child in self._children:
+                child.close()
+            return
         self._iterator.close()
+
+
+def _pinned_cat(tensors: list[torch.Tensor]) -> torch.Tensor:
+    pin = torch.cuda.is_available() and all(t.is_pinned() for t in tensors)
+    out = torch.empty(
+        sum(t.shape[0] for t in tensors),
+        dtype=tensors[0].dtype,
+        pin_memory=pin,
+    )
+    return torch.cat(tensors, out=out)
