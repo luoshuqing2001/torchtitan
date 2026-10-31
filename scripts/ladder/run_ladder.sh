@@ -130,6 +130,9 @@ while read -r flavor variant mb extra; do
   # A non-default architecture (ARCH=qmlp) gets its own run name too.
   arch=$(grep -oE "ARCH=[a-z]+" <<< "${extra}" | cut -d= -f2)
   [[ -n $arch && $arch != ffn ]] && name=${name}_${arch}
+  # RUN_TAG=<tag> separates runs that differ only in other settings (LR, steps).
+  tag=$(grep -oE "RUN_TAG=[A-Za-z0-9_-]+" <<< "${extra}" | cut -d= -f2)
+  [[ -n $tag ]] && name=${name}_${tag}
   out=outputs/ladder/$name
   if [[ ! -f $out/DONE ]] && tail -n 50 $out/train.log 2>/dev/null | grep -q "Training completed"; then
     touch $out/DONE; echo "[ladder] $(date -u +%FT%TZ) done $name (adopted)"

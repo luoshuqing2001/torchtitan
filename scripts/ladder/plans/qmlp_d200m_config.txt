@@ -1,0 +1,4 @@
+# FFN-free ladder: query MLP on SWA layers, pure dense.
+# d400m_dense_qmlp (254.6M) is close to d200m_dense (260.1M) in parameters,
+# so this run uses the d200m_dense recipe: LR 4e-4, 9922 steps (5.20B tokens).
+d400m 0 64 ARCH=qmlp LR=4e-4 TRAIN_STEPS=9922 RUN_TAG=d200mcfg

@@ -1,0 +1,2 @@
+# FFN-free ladder: query MLP on SWA layers, pure dense, same tokens as d400m_dense.
+d400m 0 64 ARCH=qmlp
