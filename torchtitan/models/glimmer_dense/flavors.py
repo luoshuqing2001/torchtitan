@@ -91,11 +91,11 @@ _EMBEDDING_INIT = {"weight": partial(nn.init.normal_, std=0.02)}
 _VOCAB_SIZE = 100352
 _EOS_TOKEN_ID = 100257
 _HEAD_DIM = 64
-# head_dim=128 keeps the hidden sizes and depths but uses 128-dim heads with
-# 8 / 12 / 16 / 20 query heads, so every flavor keeps GQA 4:1 with whole KV
-# heads. The query/output width (heads * 128) is then decoupled from dim.
+# head_dim=128 keeps the hidden sizes and depths and uses dim / 128 query
+# heads (8 / 10 / 12 / 16), so the query width equals dim at every flavor.
+# KV heads keep GQA 4:1 where it divides; d400m (10 heads) uses 2 KV heads (5:1).
 HEAD_DIMS = (64, 128)
-_N_HEADS_AT_128 = {1024: 8, 1280: 12, 1536: 16, 2048: 20}
+_KV_HEADS_AT_128 = {1024: 2, 1280: 2, 1536: 3, 2048: 4}
 _FFN_MULTIPLIER = 3
 _WINDOW_PATTERN = [512, 512, 512, 0]
 _NORM_EPS = 1e-5
@@ -279,9 +279,16 @@ def _deepseek_engram_config(
     )
 
 
-def _query_mlp_attention(attention, *, dim: int, intermediate: int):
+def _query_mlp_attention(
+    attention, *, dim: int, intermediate: int, residual: bool = False
+):
     """Replace a sliding-window layer's fused QKV with a query MLP + linear KV."""
     qkv = attention.qkv_linear
+    if residual and qkv.n_heads * qkv.head_dim != dim:
+        raise ValueError(
+            f"qmlp_residual needs query width {qkv.n_heads * qkv.head_dim} "
+            f"to equal dim {dim}"
+        )
     up_init, down_init = query_mlp_param_init(dim, intermediate)
     attention.qkv_linear = QueryMLPKVLinear.Config(
         head_dim=qkv.head_dim,
@@ -300,6 +307,7 @@ def _query_mlp_attention(attention, *, dim: int, intermediate: int):
             out_features=2 * qkv.n_kv_heads * qkv.head_dim,
             param_init=_LINEAR_INIT,
         ),
+        residual=residual,
     )
     return attention
 
@@ -318,9 +326,10 @@ def _flavor_config(
     qmlp_intermediate: int | None = None,
     qmlp_swa_per_full: int = _QMLP_SWA_PER_FULL,
     head_dim: int = _HEAD_DIM,
+    qmlp_residual: bool = False,
 ) -> GlimmerDenseModel.Config:
-    n_heads = dim // head_dim if head_dim == _HEAD_DIM else _N_HEADS_AT_128[dim]
-    n_kv_heads = n_heads // 4
+    n_heads = dim // head_dim
+    n_kv_heads = n_heads // 4 if head_dim == _HEAD_DIM else _KV_HEADS_AT_128[dim]
     hidden_dim = _FFN_MULTIPLIER * dim
     if arch == "qmlpdeep":
         n_layers = (n_layers // 4) * (qmlp_swa_per_full + 1)
@@ -356,7 +365,10 @@ def _flavor_config(
             if not full:
                 assert qmlp_intermediate is not None
                 attention = _query_mlp_attention(
-                    attention, dim=dim, intermediate=qmlp_intermediate
+                    attention,
+                    dim=dim,
+                    intermediate=qmlp_intermediate,
+                    residual=qmlp_residual,
                 )
             layers.append(
                 GlimmerAttentionBlock.Config(
@@ -472,6 +484,7 @@ def build_model_config(
     qmlp_intermediate: int | None = None,
     qmlp_swa_per_full: int = _QMLP_SWA_PER_FULL,
     head_dim: int = _HEAD_DIM,
+    qmlp_residual: bool = False,
 ) -> GlimmerDenseModel.Config:
     dim, n_layers, max_context_len = MODEL_FLAVORS[flavor]
     context_len = seq_len or max_context_len
@@ -508,6 +521,7 @@ def build_model_config(
         qmlp_intermediate=qmlp_intermediate,
         qmlp_swa_per_full=qmlp_swa_per_full,
         head_dim=head_dim,
+        qmlp_residual=qmlp_residual,
     )
     if converters is not None:
         validate_converter_compatibility(converters)

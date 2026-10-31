@@ -188,8 +188,10 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
     dense run at that flavor. ``ARCH=qmlpdeep`` keeps the dense model's
     global-layer count, puts ``QMLP_SWA_PER_FULL`` (default 5) sliding-window
     layers before each, and uses query MLP width ``QMLP_INTERMEDIATE``
-    (default 2 * dim). ``HEAD_DIM=128`` uses 128-dim heads with 8 / 12 / 16 / 20
-    query heads (GQA 4:1) at the same hidden sizes and depths.
+    (default 2 * dim). ``HEAD_DIM=128`` uses 128-dim heads with dim / 128 query
+    heads (8 / 10 / 12 / 16; KV 2 / 2 / 3 / 4) at the same hidden sizes and depths.
+    ``QMLP_RESIDUAL=1`` adds the attention input to the query MLP output
+    (``q = x + W_down GELU(W_up x)``); it needs query width == dim.
 
     Matrix parameters use Moonlight Muon. Embeddings, norms, and the LM head
     stay on AdamW at the same base learning rate. The schedule is WSD: 2%
@@ -219,6 +221,7 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
     qmlp_intermediate_env = os.environ.get("QMLP_INTERMEDIATE")
     qmlp_swa_per_full = int(os.environ.get("QMLP_SWA_PER_FULL", "5"))
     head_dim = int(os.environ.get("HEAD_DIM", "64"))
+    qmlp_residual = os.environ.get("QMLP_RESIDUAL", "0") == "1"
     use_fp8 = os.environ.get("FP8", "1") != "0"
     converters = []
     if use_fp8:
@@ -244,6 +247,7 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
         ),
         qmlp_swa_per_full=qmlp_swa_per_full,
         head_dim=head_dim,
+        qmlp_residual=qmlp_residual,
     )
     model_config.ple_async_training = ple_async_training
     model_config.ple_unbind_inputs = unbind_flag == "1"

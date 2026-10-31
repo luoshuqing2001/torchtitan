@@ -63,6 +63,8 @@ class QueryMLPKVLinear(Module):
         q_down: Linear.Config
         # Fused [n_kv_heads, 2, head_dim] key/value rows.
         wkv: Linear.Config
+        # q = x + W_down GELU(W_up x). Needs n_heads * head_dim == dim.
+        residual: bool = False
 
     def __init__(self, config: Config):
         super().__init__()
@@ -70,6 +72,7 @@ class QueryMLPKVLinear(Module):
         self.q_up = config.q_up.build()
         self.q_down = config.q_down.build()
         self.wkv = config.wkv.build()
+        self.residual = config.residual
 
     @spmd.local_map(
         out_types=(
@@ -85,6 +88,8 @@ class QueryMLPKVLinear(Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         num_tokens = x.shape[0]
         xq = self.q_down(F.gelu(self.q_up(x)))
+        if self.residual:
+            xq = xq + x
         kv = self.wkv(x)
         with spmd.local():
             xq = xq.view(num_tokens, -1, self.head_dim)

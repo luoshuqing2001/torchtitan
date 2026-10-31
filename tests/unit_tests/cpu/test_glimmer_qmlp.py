@@ -154,15 +154,17 @@ def test_qmlpdeep_matrices_use_muon():
 
 
 @pytest.mark.parametrize(
-    "flavor,heads", [("d200m", 8), ("d400m", 12), ("d700m", 16), ("d1b", 20)]
+    "flavor,heads,kv",
+    [("d200m", 8, 2), ("d400m", 10, 2), ("d700m", 12, 3), ("d1b", 16, 4)],
 )
-def test_head_dim_128_heads_and_gqa(flavor, heads):
+def test_head_dim_128_heads_and_gqa(flavor, heads, kv):
     with torch.device("meta"):
         model = build_model_config(flavor, head_dim=128).build()
     attention = model.layers["0"].attention
     assert attention.head_dim == 128
     assert attention.n_heads == heads
-    assert attention.n_kv_heads == heads // 4
+    assert attention.n_kv_heads == kv
+    assert heads * 128 == model.config.dim
     assert attention.o_gate.weight.shape[0] == heads * 128
     assert attention.wo.weight.shape[1] == heads * 128
 
@@ -188,5 +190,33 @@ def test_head_dim_128_qmlpdeep_queries_match_heads():
     assert len(model.layers) == 32
     qkv = model.layers["0"].attention.qkv_linear
     assert qkv.q_up.weight.shape == (1760, 1280)
-    assert qkv.q_down.weight.shape == (12 * 128, 1760)
-    assert qkv.wkv.weight.shape == (2 * 3 * 128, 1280)
+    assert qkv.q_down.weight.shape == (10 * 128, 1760)
+    assert qkv.wkv.weight.shape == (2 * 2 * 128, 1280)
+
+
+def test_qmlp_residual_adds_input():
+    torch.manual_seed(0)
+    model = build_model_config(
+        "d200m",
+        arch="qmlpdeep",
+        head_dim=128,
+        qmlp_swa_per_full=7,
+        qmlp_intermediate=1408,
+        qmlp_residual=True,
+    ).build()
+    model.init_states()
+    qkv = model.layers["0"].attention.qkv_linear
+    assert qkv.residual
+    x = torch.randn(16, 1024)
+    xq, _, _ = qkv(x)
+    mlp = qkv.q_down(torch.nn.functional.gelu(qkv.q_up(x)))
+    torch.testing.assert_close(xq.reshape(16, -1), mlp + x)
+
+
+@pytest.mark.parametrize("flavor", ["d400m", "d700m", "d1b"])
+def test_qmlp_residual_builds_at_every_flavor(flavor):
+    with torch.device("meta"):
+        model = build_model_config(
+            flavor, arch="qmlpdeep", head_dim=128, qmlp_residual=True
+        ).build()
+    assert model.layers["0"].attention.qkv_linear.residual
