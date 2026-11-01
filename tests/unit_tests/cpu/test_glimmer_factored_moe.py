@@ -25,9 +25,8 @@ from torchtitan_recipes.models.glimmer_muon import (
 
 def _layer(split: bool, **kwargs) -> FactoredMoE:
     torch.manual_seed(0)
-    layer = FactoredMoE(
-        FactoredMoE.Config(dim=16, hidden_dim=8, num_experts=6, top_k=2, split=split, **kwargs)
-    )
+    kwargs = {"dim": 16, "hidden_dim": 8, "num_experts": 6, "top_k": 2, **kwargs}
+    layer = FactoredMoE(FactoredMoE.Config(split=split, **kwargs))
     for parameter in layer.parameters():
         torch.nn.init.normal_(parameter, std=0.3)
     # Nonzero biases check that they change only the choice, not the weights.
@@ -74,6 +73,56 @@ def test_split_matches_sum_over_composite_experts():
                 )
                 expected[token] += s[token, a] * t[token, b] * (layer.w_down[i] @ hidden)
     torch.testing.assert_close(layer(x), expected.reshape(x.shape), rtol=1e-5, atol=1e-5)
+
+
+def _swiglu(x, gate, up, down):
+    return down @ (F.silu(gate @ x) * (up @ x))
+
+
+def test_rank_pairing_matches_rank_by_rank_sum():
+    layer = _layer(split=True, pairing="rank", num_gate_experts=5, top_k=3, gate_top_k=3)
+    x = torch.randn(9, 16)
+    s, ud = _route(x, layer.router_weight, layer.expert_bias, 3)
+    t, gate = _route(x, layer.gate_router_weight, layer.gate_expert_bias, 3)
+    expected = torch.zeros_like(x)
+    for token in range(x.shape[0]):
+        s_rank = s[token].argsort(descending=True)
+        t_rank = t[token].argsort(descending=True)
+        weights = s[token, s_rank] * t[token, t_rank]
+        weights = weights / weights.sum()
+        for r in range(3):
+            i, j = ud[token, s_rank[r]], gate[token, t_rank[r]]
+            expected[token] += weights[r] * _swiglu(
+                x[token], layer.w_gate[j], layer.w_up[i], layer.w_down[i]
+            )
+    torch.testing.assert_close(layer(x), expected, rtol=1e-5, atol=1e-5)
+
+
+def test_shared_experts_add_unweighted_swiglus():
+    routed = _layer(split=False)
+    shared = _layer(split=False, num_shared_experts=2)
+    with torch.no_grad():
+        for name in ("router_weight", "w_gate", "w_up", "w_down", "expert_bias"):
+            getattr(shared, name).copy_(getattr(routed, name))
+    x = torch.randn(7, 16)
+    expected = routed(x) + sum(
+        torch.stack(
+            [
+                _swiglu(row, shared.shared_w_gate[e], shared.shared_w_up[e], shared.shared_w_down[e])
+                for row in x
+            ]
+        )
+        for e in range(2)
+    )
+    torch.testing.assert_close(shared(x), expected, rtol=1e-5, atol=1e-5)
+
+
+def test_rank_pairing_needs_equal_top_k():
+    with pytest.raises(ValueError):
+        FactoredMoE.Config(
+            dim=16, hidden_dim=8, num_experts=6, top_k=2, split=True,
+            gate_top_k=3, pairing="rank",
+        )
 
 
 def test_split_gradients_reach_both_routers():
@@ -125,9 +174,28 @@ def test_split_and_standard_match_in_parameters_and_active_flops():
     assert split_flops == moe_flops + 6 * routers_moe
 
 
+def test_qwen3_pair_parameters_and_flops():
+    """128 experts: top 6 + 2 shared vs rank-paired top 4 / top 4 + 2 shared."""
+    moe = _meta_model("moe", moe_experts=128, moe_top_k=6, moe_shared=2)
+    split = _meta_model(
+        "moe_split", moe_experts=128, moe_top_k=4, moe_gate_experts=128,
+        moe_gate_top_k=4, moe_pairing="rank", moe_shared=2,
+    )
+    count = lambda model: sum(p.numel() for p in model.parameters())
+    router = 12 * 128 * 1024
+    assert count(split) == count(moe) + router
+    unit = 12 * 384 * 1024  # one expert matrix in every layer
+    _, moe_flops = moe.config.get_nparams_and_flops(moe, 2048)
+    _, split_flops = split.config.get_nparams_and_flops(split, 2048)
+    # moe: 3 * (6 + 2) expert matrices; split: 4 + 2 * 4 routed + 3 * 2 shared.
+    assert moe_flops - split_flops == 6 * ((24 - 18) * unit - router)
+
+
 @pytest.mark.parametrize("arch", ["moe", "moe_split"])
 def test_muon_covers_every_routed_matrix(arch):
-    config = build_model_config("d200m", arch=arch, head_dim=128, swa_rotary_dim=32)
+    config = build_model_config(
+        "d200m", arch=arch, head_dim=128, swa_rotary_dim=32, moe_shared=2
+    )
     optim = glimmer_muon_optimizer(
         config, lr=1e-3, parallelism=ParallelismConfig(tensor_parallel_degree=1)
     )

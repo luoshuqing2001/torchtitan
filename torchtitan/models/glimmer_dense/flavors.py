@@ -40,6 +40,9 @@ dense FFN's active width (8 * 384 = 3072) and hold 4x its parameters.
 ``arch="moe_split"`` has the same up/down pool and a separately routed pool
 of ``moe_gate_experts`` gate matrices (default the same sizes), so it matches
 ``moe`` in parameters and FLOPs while composing 32 x 32 experts from them.
+``moe_pairing="rank"`` pairs the two pools' top-k by rank instead (the r-th
+gate with the r-th up/down pair). ``moe_shared`` adds always-on SwiGLU experts
+of width ``moe_hidden``.
 
 ``arch="qmlpdeep"`` keeps the dense model's number of global (NoPE) layers,
 L / 4, and puts ``qmlp_swa_per_full`` (default 5) sliding-window layers before
@@ -302,6 +305,8 @@ def _routed_ffn(
     hidden: int,
     gate_experts: int | None,
     gate_top_k: int | None,
+    pairing: str = "cross",
+    shared: int = 0,
 ) -> FactoredMoE.Config:
     """Routed SwiGLU in place of the dense FFN, initialized like it.
 
@@ -317,6 +322,10 @@ def _routed_ffn(
     }
     if split:
         param_init["gate_router_weight"] = _LINEAR_INIT["weight"]
+    if shared:
+        param_init["shared_w_gate"] = _LINEAR_INIT["weight"]
+        param_init["shared_w_up"] = depth
+        param_init["shared_w_down"] = depth
     return FactoredMoE.Config(
         dim=dim,
         hidden_dim=hidden,
@@ -325,6 +334,8 @@ def _routed_ffn(
         split=split,
         num_gate_experts=gate_experts if split else None,
         gate_top_k=gate_top_k if split else None,
+        pairing=pairing,
+        num_shared_experts=shared,
         param_init=param_init,
     )
 
@@ -478,6 +489,8 @@ def _flavor_config(
     moe_hidden: int = _MOE_HIDDEN,
     moe_gate_experts: int | None = None,
     moe_gate_top_k: int | None = None,
+    moe_pairing: str = "cross",
+    moe_shared: int = 0,
 ) -> GlimmerDenseModel.Config:
     n_heads = dim // head_dim if head_dim == _HEAD_DIM else _N_HEADS_AT_128[dim]
     swa_rope = (
@@ -612,6 +625,8 @@ def _flavor_config(
                         hidden=moe_hidden,
                         gate_experts=moe_gate_experts,
                         gate_top_k=moe_gate_top_k,
+                        pairing=moe_pairing,
+                        shared=moe_shared,
                     )
                     if arch in ("moe", "moe_split")
                     else make_ffn_config(
@@ -685,6 +700,8 @@ def build_model_config(
     moe_hidden: int = _MOE_HIDDEN,
     moe_gate_experts: int | None = None,
     moe_gate_top_k: int | None = None,
+    moe_pairing: str = "cross",
+    moe_shared: int = 0,
 ) -> GlimmerDenseModel.Config:
     dim, n_layers, max_context_len = MODEL_FLAVORS[flavor]
     context_len = seq_len or max_context_len
@@ -732,6 +749,8 @@ def build_model_config(
         moe_hidden=moe_hidden,
         moe_gate_experts=moe_gate_experts,
         moe_gate_top_k=moe_gate_top_k,
+        moe_pairing=moe_pairing,
+        moe_shared=moe_shared,
     )
     if converters is not None:
         validate_converter_compatibility(converters)

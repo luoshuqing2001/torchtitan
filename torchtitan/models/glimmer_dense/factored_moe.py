@@ -24,6 +24,16 @@ pairs is
 
 which costs the same FLOPs as the standard layer with the same pool sizes.
 
+With ``pairing="rank"`` the split layer instead pairs the two pools' top-k by
+rank: each pool's experts are ordered by router score, and the r-th up/down
+pair uses the r-th gate, so only ``top_k`` composite experts are active
+(``gate_top_k`` must equal ``top_k``), each with its own gate. Their weights
+``s_r * t_r`` are renormalized to sum to one. It costs the same FLOPs as the
+cross pairing.
+
+``num_shared_experts`` adds always-on SwiGLU experts of the routed width,
+summed into the output unweighted (Qwen3 / DeepSeek shared experts).
+
 Both layers use softmax router scores renormalized over the top-k, and the
 auxiliary-loss-free expert bias of DeepSeek-V3 (one bias per pool), updated
 before every optimizer step by ``register_factored_moe_balancing_hook``.
@@ -79,9 +89,15 @@ class FactoredMoE(Module):
         # Gate pool of the split layer; default to the up/down pool's sizes.
         num_gate_experts: int | None = None
         gate_top_k: int | None = None
+        # "cross": every selected gate with every selected up/down pair.
+        # "rank": the r-th gate with the r-th up/down pair.
+        pairing: str = "cross"
+        num_shared_experts: int = 0
         load_balance_coeff: float = 1e-3
 
         def __post_init__(self) -> None:
+            if self.pairing not in ("cross", "rank"):
+                raise ValueError(f"pairing must be 'cross' or 'rank', got {self.pairing!r}")
             if not self.split and (
                 self.num_gate_experts not in (None, self.num_experts)
                 or self.gate_top_k not in (None, self.top_k)
@@ -95,6 +111,10 @@ class FactoredMoE(Module):
                 raise ValueError("top_k must be in [1, num_experts]")
             if not 0 < self.gate_top_k <= self.num_gate_experts:
                 raise ValueError("gate_top_k must be in [1, num_gate_experts]")
+            if self.pairing == "rank" and (
+                not self.split or self.gate_top_k != self.top_k
+            ):
+                raise ValueError("rank pairing needs split=True and gate_top_k == top_k")
 
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -106,6 +126,14 @@ class FactoredMoE(Module):
         self.top_k = config.top_k
         self.gate_top_k = config.gate_top_k
         self.load_balance_coeff = config.load_balance_coeff
+        self.pairing = config.pairing
+        n_shared = config.num_shared_experts
+        if n_shared:
+            self.shared_w_gate = nn.Parameter(torch.empty(n_shared, hidden, dim))
+            self.shared_w_up = nn.Parameter(torch.empty(n_shared, hidden, dim))
+            self.shared_w_down = nn.Parameter(torch.empty(n_shared, dim, hidden))
+        else:
+            self.shared_w_gate = self.shared_w_up = self.shared_w_down = None
         self.router_weight = nn.Parameter(torch.empty(n_ud, dim))
         self.w_gate = nn.Parameter(torch.empty(n_gate, hidden, dim))
         self.w_up = nn.Parameter(torch.empty(n_ud, hidden, dim))
@@ -155,12 +183,22 @@ class FactoredMoE(Module):
         bias_E: torch.Tensor,
         counts_E: torch.Tensor,
         top_k: int,
+        *,
+        by_score: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Top-k softmax routing; the bias only changes which experts win."""
+        """Top-k softmax routing; the bias only changes which experts win.
+
+        ``by_score`` orders each token's experts by descending router score.
+        """
         scores_TE = F.linear(x_TD.float(), weight_ED.float()).softmax(dim=-1)
         with torch.no_grad():
             ids_TK = torch.topk(scores_TE + bias_E, k=top_k, dim=-1, sorted=False).indices
         weights_TK = scores_TE.gather(-1, ids_TK)
+        if by_score:
+            with torch.no_grad():
+                rank_TK = weights_TK.argsort(dim=-1, descending=True)
+            ids_TK = ids_TK.gather(-1, rank_TK)
+            weights_TK = weights_TK.gather(-1, rank_TK)
         weights_TK = weights_TK / (weights_TK.sum(dim=-1, keepdim=True) + 1e-20)
         if self.training and not remat.is_recomputing():
             with torch.no_grad():
@@ -183,13 +221,24 @@ class FactoredMoE(Module):
         shape = x.shape
         x_TD = x.reshape(-1, shape[-1])
         n_ud = self.w_up.shape[0]
+        rank = self.pairing == "rank"
         weights_TK, ids_TK = self._route(
-            x_TD, self.router_weight, self.expert_bias, self.tokens_per_expert, self.top_k
+            x_TD,
+            self.router_weight,
+            self.expert_bias,
+            self.tokens_per_expert,
+            self.top_k,
+            by_score=rank,
         )
         order_N, token_N, offsets_E = self._sort(ids_TK, n_ud)
         x_ND = x_TD[token_N]
         up_NF = _grouped_mm(x_ND, self.w_up, offsets_E)
-        if self.split:
+        if rank:
+            gate_weights_TK, gate_NF = self._ranked_gates(x_TD)
+            hidden_NF = gate_NF[order_N] * up_NF
+            weights_TK = weights_TK * gate_weights_TK
+            weights_TK = weights_TK / weights_TK.sum(dim=-1, keepdim=True)
+        elif self.split:
             gate_TF = self._mixed_gate(x_TD)
             hidden_NF = gate_TF[token_N] * up_NF
         else:
@@ -198,7 +247,34 @@ class FactoredMoE(Module):
         out_ND = _grouped_mm(hidden_NF, self.w_down, offsets_E)
         out_ND = (out_ND.float() * weights_TK.reshape(-1)[order_N, None]).to(x.dtype)
         out_TD = _scatter_rows(torch.zeros_like(x_TD), token_N, out_ND)
+        if self.shared_w_gate is not None:
+            out_TD = out_TD + self._shared(x_TD)
         return out_TD.reshape(shape)
+
+    def _shared(self, x_TD: torch.Tensor) -> torch.Tensor:
+        """Sum of the always-on SwiGLU experts, as one wide gate/up/down."""
+        assert self.shared_w_up is not None and self.shared_w_down is not None
+        n_shared, hidden, dim = self.shared_w_up.shape
+        gate_TF = F.linear(x_TD, self.shared_w_gate.reshape(-1, dim).to(x_TD.dtype))
+        up_TF = F.linear(x_TD, self.shared_w_up.reshape(-1, dim).to(x_TD.dtype))
+        down_DF = self.shared_w_down.permute(1, 0, 2).reshape(dim, n_shared * hidden)
+        return F.linear(F.silu(gate_TF) * up_TF, down_DF.to(x_TD.dtype))
+
+    def _ranked_gates(self, x_TD: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gate-pool weights ``(T, K)`` ordered by score and each assignment's
+        ``SiLU(W_gate[j] x)`` in the same token-major order ``(T * K, F)``."""
+        n_gate = self.w_gate.shape[0]
+        weights_TK, ids_TK = self._route(
+            x_TD,
+            self.gate_router_weight,
+            self.gate_expert_bias,
+            self.tokens_per_gate_expert,
+            self.gate_top_k,
+            by_score=True,
+        )
+        order_N, token_N, offsets_E = self._sort(ids_TK, n_gate)
+        gate_NF = F.silu(_grouped_mm(x_TD[token_N], self.w_gate, offsets_E))
+        return weights_TK, gate_NF[torch.argsort(order_N)]
 
     def _mixed_gate(self, x_TD: torch.Tensor) -> torch.Tensor:
         """``G = sum_j t_j SiLU(W_gate[j] x)`` over each token's gate experts."""

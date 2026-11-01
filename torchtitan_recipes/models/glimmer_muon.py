@@ -60,7 +60,8 @@ _MUON_PATTERN = (
     r"moe\.routed_experts\.w(?:13|2)\.weight|"
     r"moe\.router\.gate\.weight|"
     r"feed_forward\.w(?:13|2)\.weight|"
-    r"feed_forward\.(?:w_gate|w_up|w_down|router_weight|gate_router_weight)"
+    r"feed_forward\.(?:w_gate|w_up|w_down|router_weight|gate_router_weight|"
+    r"shared_w_gate|shared_w_up|shared_w_down)"
     r")$"
 )
 
@@ -175,6 +176,10 @@ def glimmer_muon_optimizer(
             matrices[f"{ffn}.router_weight"] = _owned(dense_axis)
             if feed_forward.split:
                 matrices[f"{ffn}.gate_router_weight"] = _owned(dense_axis)
+            if feed_forward.num_shared_experts:
+                # Stacked shared experts: Newton-Schulz per expert, like w13.
+                for name in ("shared_w_gate", "shared_w_up", "shared_w_down"):
+                    matrices[f"{ffn}.{name}"] = _matrix_rows(dense_axis)
         elif feed_forward is not None:
             matrices[f"{prefix}.feed_forward.w13.weight"] = _matrix_rows(dense_axis)
             matrices[f"{prefix}.feed_forward.w2.weight"] = _owned(dense_axis)

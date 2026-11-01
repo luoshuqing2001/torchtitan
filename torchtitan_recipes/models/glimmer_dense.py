@@ -205,7 +205,9 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
     ``ARCH=moe_split`` routes the gate matrices as their own pool of
     ``MOE_GATE_EXPERTS`` (default MOE_EXPERTS) with top ``MOE_GATE_TOP_K``
     (default MOE_TOP_K), so composite experts pair any gate with any up/down.
-    Both keep the dense token budget.
+    ``MOE_PAIRING=rank`` pairs the r-th gate with the r-th up/down pair instead
+    of every gate with every pair. ``MOE_SHARED`` (default 0) adds always-on
+    SwiGLU experts of width MOE_HIDDEN. Both keep the dense token budget.
 
     Matrix parameters use Moonlight Muon. Embeddings, norms, and the LM head
     stay on AdamW at the same base learning rate. The schedule is WSD: 2%
@@ -277,6 +279,8 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
             None if moe_gate_experts_env is None else int(moe_gate_experts_env)
         ),
         moe_gate_top_k=None if moe_gate_top_k_env is None else int(moe_gate_top_k_env),
+        moe_pairing=os.environ.get("MOE_PAIRING", "cross"),
+        moe_shared=int(os.environ.get("MOE_SHARED", "0")),
     )
     model_config.ple_async_training = ple_async_training
     model_config.ple_unbind_inputs = unbind_flag == "1"

@@ -127,6 +127,8 @@ def _set_factored_moe_sharding(moe_config, *, enable_sp: bool) -> None:
     if moe_config.split:
         names += ["gate_router_weight", "gate_expert_bias"]
         counts += ["tokens_per_gate_expert"]
+    if moe_config.num_shared_experts:
+        names += ["shared_w_gate", "shared_w_up", "shared_w_down"]
     # Expert loads are per-rank partial sums, as for the MoE router's.
     state = {name: weight for name in names}
     state.update({name: _tokens_per_expert_placement() for name in counts})
