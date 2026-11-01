@@ -1,0 +1,4 @@
+# Two-pool routed FFN with 4 of 32 gate matrices and 4 of 32 up/down pairs per token (16 composite
+# experts active), micro 128 / gradient accumulation 2 like the standard MoE. Same parameters as
+# hd128_moe.txt; half its FFN FLOPs (4 + 2 * 4 = 12 vs 3 * 8 = 24 expert matmuls).
+d200m 0 128 ARCH=moe_split MOE_EXPERTS=32 MOE_TOP_K=4 MOE_HIDDEN=384 MOE_GATE_EXPERTS=32 MOE_GATE_TOP_K=4 HEAD_DIM=128 SWA_ROTARY_DIM=32 LR=1.4e-3 DATA_SHARDS=4 RUN_TAG=e32k4g32k4h384prope32hd128lr14ds4
