@@ -1,3 +1,4 @@
-# Head dim 128, qmlpdeep 7:1, query MLP 1408 with residual (q = x + MLP(x)), LR 1.4e-3,
-# 1 GPU, DATA_SHARDS=4 with accumulation 2.
-d200m 0 128 ARCH=qmlpdeep QMLP_SWA_PER_FULL=7 QMLP_INTERMEDIATE=1408 QMLP_RESIDUAL=1 HEAD_DIM=128 LR=1.4e-3 TRAIN_STEPS=9922 DATA_SHARDS=4 RUN_TAG=s7q1408reshd128lr14ds4
+# New ladder, d200m Q-MLP: 7 SWA per global layer, linear-residual query MLP (W_down zero-init),
+# iQ 1344 = largest multiple of 64 with params and FLOPs/token <= the dense d200m.
+# Ladder iQ: d200m 1344, d400m 1280, d700m 1280, d1b 2112.
+d200m 0 128 ARCH=qmlpdeep QMLP_SWA_PER_FULL=7 QMLP_INTERMEDIATE=1344 QMLP_RESIDUAL=1 HEAD_DIM=128 LR=1.4e-3 DATA_SHARDS=4 RUN_TAG=s7q1344linreshd128lr14ds4

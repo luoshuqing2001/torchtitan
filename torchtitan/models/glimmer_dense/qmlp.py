@@ -7,9 +7,9 @@
 """Nonlinear query projection for the FFN-free Glimmer ladder.
 
 The query pathway of a sliding-window layer is a two-layer GELU MLP,
-``q = W_down GELU(W_up x)``, as in scalable attention (SMLA/SGQA). Keys and
-values keep a fused linear projection, so heads, head dim and the KV cache
-are unchanged.
+``q = W_down GELU(W_up x)``, as in scalable attention (SMLA/SGQA), optionally
+added to a linear query ``W_q x`` (a linear residual). Keys and values keep a
+fused linear projection, so heads, head dim and the KV cache are unchanged.
 """
 
 from __future__ import annotations
@@ -63,8 +63,8 @@ class QueryMLPKVLinear(Module):
         q_down: Linear.Config
         # Fused [n_kv_heads, 2, head_dim] key/value rows.
         wkv: Linear.Config
-        # q = x + W_down GELU(W_up x). Needs n_heads * head_dim == dim.
-        residual: bool = False
+        # Linear residual: q = W_q x + W_down GELU(W_up x).
+        wq: Linear.Config | None = None
 
     def __init__(self, config: Config):
         super().__init__()
@@ -72,7 +72,7 @@ class QueryMLPKVLinear(Module):
         self.q_up = config.q_up.build()
         self.q_down = config.q_down.build()
         self.wkv = config.wkv.build()
-        self.residual = config.residual
+        self.wq = None if config.wq is None else config.wq.build()
 
     @spmd.local_map(
         out_types=(
@@ -88,8 +88,8 @@ class QueryMLPKVLinear(Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         num_tokens = x.shape[0]
         xq = self.q_down(F.gelu(self.q_up(x)))
-        if self.residual:
-            xq = xq + x
+        if self.wq is not None:
+            xq = xq + self.wq(x)
         kv = self.wkv(x)
         with spmd.local():
             xq = xq.view(num_tokens, -1, self.head_dim)

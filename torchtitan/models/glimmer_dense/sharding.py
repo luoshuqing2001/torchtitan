@@ -75,8 +75,9 @@ def _set_attention_only_layer_sharding(layer_cfg, *, enable_sp: bool) -> None:
     gathered = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
     qkv = attention.qkv_linear
     if isinstance(qkv, QueryMLPKVLinear.Config):
-        for linear in (qkv.q_up, qkv.q_down, qkv.wkv):
-            linear.sharding_config = colwise_config(input_layout=gathered)
+        for linear in (qkv.q_up, qkv.q_down, qkv.wkv, qkv.wq):
+            if linear is not None:
+                linear.sharding_config = colwise_config(input_layout=gathered)
     else:
         qkv.wqkv.sharding_config = colwise_config(input_layout=gathered)
     attention.wo.sharding_config = rowwise_config(output_layout=x_layout)

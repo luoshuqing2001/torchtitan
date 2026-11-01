@@ -53,7 +53,7 @@ def glimmer_wsd_scheduler(steps: int) -> LRSchedulersContainer.Config:
 _MUON_PATTERN = (
     r"(?:"
     r"attention\.qkv_linear\.wqkv\.weight|"
-    r"attention\.qkv_linear\.(?:q_up|q_down|wkv)\.weight|"
+    r"attention\.qkv_linear\.(?:q_up|q_down|wkv|wq)\.weight|"
     r"attention\.wo\.weight|"
     r"attention\.o_gate\.weight|"
     r"shared_experts\.\d+\.w(?:13|2)\.weight|"
@@ -136,6 +136,8 @@ def glimmer_muon_optimizer(
                 f"{qkv}.q_down.weight": _per_head(dense_axis, head_dim),
                 f"{qkv}.wkv.weight": _per_head(dense_axis, head_dim),
             }
+            if getattr(attention.qkv_linear, "wq", None) is not None:
+                matrices[f"{qkv}.wq.weight"] = _per_head(dense_axis, head_dim)
         else:
             matrices = {f"{qkv}.wqkv.weight": _per_head(dense_axis, head_dim)}
         matrices[f"{prefix}.attention.wo.weight"] = _owned(dense_axis)
