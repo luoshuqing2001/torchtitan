@@ -1,0 +1,4 @@
+# d200m routed FFN on the hd128 dense baseline's attention (per-head partial RoPE 32/128 on SWA,
+# NoPE global, 8/2 heads), LR 1.4e-3, 10240 steps, 1 GPU, DATA_SHARDS=4 (same data as the dense run).
+# Standard MoE: 32 SwiGLU experts of width 384, top 8 (active width 3072 = dense FFN, 4x its params).
+d200m 0 128 ARCH=moe MOE_EXPERTS=32 MOE_TOP_K=8 MOE_HIDDEN=384 HEAD_DIM=128 SWA_ROTARY_DIM=32 LR=1.4e-3 DATA_SHARDS=4 RUN_TAG=e32k8h384prope32hd128lr14ds4

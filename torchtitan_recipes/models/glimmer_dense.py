@@ -199,6 +199,14 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
     layers SGQA-style projections whose rotated key part is one head shared by
     all KV groups (decoupled RoPE).
 
+    ``ARCH=moe`` replaces every FFN with a token-choice SwiGLU MoE of
+    ``MOE_EXPERTS`` (default 32) experts of width ``MOE_HIDDEN`` (384), top
+    ``MOE_TOP_K`` (8): the dense FFN's active width with 4x its parameters.
+    ``ARCH=moe_split`` routes the gate matrices as their own pool of
+    ``MOE_GATE_EXPERTS`` (default MOE_EXPERTS) with top ``MOE_GATE_TOP_K``
+    (default MOE_TOP_K), so composite experts pair any gate with any up/down.
+    Both keep the dense token budget.
+
     Matrix parameters use Moonlight Muon. Embeddings, norms, and the LM head
     stay on AdamW at the same base learning rate. The schedule is WSD: 2%
     warmup, 88% at the peak, then 10% cosine decay to one tenth of the peak.
@@ -231,6 +239,8 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
     qmlp_zero_init = os.environ.get("QMLP_ZERO_INIT", "mlp")
     swa_rotary_env = os.environ.get("SWA_ROTARY_DIM")
     swa_rotary_shared = os.environ.get("SWA_ROTARY_SHARED", "0") == "1"
+    moe_gate_experts_env = os.environ.get("MOE_GATE_EXPERTS")
+    moe_gate_top_k_env = os.environ.get("MOE_GATE_TOP_K")
     use_fp8 = os.environ.get("FP8", "1") != "0"
     converters = []
     if use_fp8:
@@ -260,6 +270,13 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
         qmlp_zero_init=qmlp_zero_init,
         swa_rotary_dim=None if swa_rotary_env is None else int(swa_rotary_env),
         swa_rotary_shared=swa_rotary_shared,
+        moe_experts=int(os.environ.get("MOE_EXPERTS", "32")),
+        moe_top_k=int(os.environ.get("MOE_TOP_K", "8")),
+        moe_hidden=int(os.environ.get("MOE_HIDDEN", "384")),
+        moe_gate_experts=(
+            None if moe_gate_experts_env is None else int(moe_gate_experts_env)
+        ),
+        moe_gate_top_k=None if moe_gate_top_k_env is None else int(moe_gate_top_k_env),
     )
     model_config.ple_async_training = ple_async_training
     model_config.ple_unbind_inputs = unbind_flag == "1"

@@ -34,6 +34,7 @@ def set_glimmer_dense_sharding_config(
     enable_sp: bool,
 ) -> None:
     """Fill sharding configs for Muse Glimmer attention and a dense SwiGLU."""
+    from .factored_moe import FactoredMoE
     from .model import GlimmerAttentionBlock
 
     from torchtitan.models.common.attention import QKVLinear
@@ -41,7 +42,10 @@ def set_glimmer_dense_sharding_config(
     set_decoder_sharding_config(config, enable_sp=enable_sp)
     for layer_cfg in config.layers:
         fused = isinstance(layer_cfg.attention.qkv_linear, QKVLinear.Config)
-        if isinstance(layer_cfg, GlimmerAttentionBlock.Config) or not fused:
+        routed = isinstance(
+            getattr(layer_cfg, "feed_forward", None), FactoredMoE.Config
+        )
+        if isinstance(layer_cfg, GlimmerAttentionBlock.Config) or not fused or routed:
             _set_attention_only_layer_sharding(layer_cfg, enable_sp=enable_sp)
         else:
             _set_muse_glimmer_layer_sharding(layer_cfg, enable_sp=enable_sp)
@@ -95,12 +99,45 @@ def _set_attention_only_layer_sharding(layer_cfg, *, enable_sp: bool) -> None:
     if attention.o_gate is not None:
         attention.o_gate.sharding_config = colwise_config(input_layout=gathered)
     if getattr(layer_cfg, "feed_forward", None) is not None:
+        from .factored_moe import FactoredMoE
+
         norm = norm_config(enable_sp=enable_sp)
         layer_cfg.ffn_norm.sharding_config = norm
         layer_cfg.post_ffn_norm.sharding_config = norm
-        set_dense_ffn_sharding(
-            layer_cfg.feed_forward, attn_x_layout=x_layout, enable_sp=enable_sp
-        )
+        if isinstance(layer_cfg.feed_forward, FactoredMoE.Config):
+            _set_factored_moe_sharding(layer_cfg.feed_forward, enable_sp=enable_sp)
+        else:
+            set_dense_ffn_sharding(
+                layer_cfg.feed_forward, attn_x_layout=x_layout, enable_sp=enable_sp
+            )
+
+
+def _set_factored_moe_sharding(moe_config, *, enable_sp: bool) -> None:
+    """Replicate the routed FFN's weights and run it in one local region.
+
+    The recipe runs it with tensor and expert parallel degree 1, so only FSDP
+    shards the weights.
+    """
+    activation = _activation_layout(enable_sp=enable_sp)
+    weight = dense_param_placement(tp=spmd.I)
+    from torchtitan.models.common.moe_sharding import _tokens_per_expert_placement
+
+    names = ["router_weight", "w_gate", "w_up", "w_down", "expert_bias"]
+    counts = ["tokens_per_expert"]
+    if moe_config.split:
+        names += ["gate_router_weight", "gate_expert_bias"]
+        counts += ["tokens_per_gate_expert"]
+    # Expert loads are per-rank partial sums, as for the MoE router's.
+    state = {name: weight for name in names}
+    state.update({name: _tokens_per_expert_placement() for name in counts})
+    moe_config.sharding_config = ShardingConfig(
+        state_shardings=state,
+        in_src_shardings={"x": activation},
+        in_dst_shardings={"x": activation},
+        out_src_shardings=activation,
+        out_dst_shardings=activation,
+        local_spmd=True,
+    )
 
 
 def _activation_layout(*, enable_sp: bool):

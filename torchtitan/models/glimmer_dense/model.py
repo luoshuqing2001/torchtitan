@@ -40,6 +40,7 @@ from torchtitan.models.utils import (
 
 from .deepseek_engram import DeepSeekEngram
 from .engram import ENGRAM_LAYER_INDEX, NGramEngram
+from .factored_moe import FactoredMoE, register_factored_moe_balancing_hook
 from .ple import LayerPLE, PerLayerEmbedder
 from .ple_dram import (
     _iter_ple_parameters,
@@ -148,6 +149,11 @@ class GlimmerDenseModel(Decoder):
                 model,
                 modules_excluded_from_active_params=excluded,
             )
+            for module in model.modules():
+                if isinstance(module, FactoredMoE):
+                    for name, fraction in module.active_fraction().items():
+                        numel = getattr(module, name).numel()
+                        active_nparams -= round(numel * (1 - fraction))
             attention_op_flops = 0
             for layer in self.layers:
                 attention = layer.attention
@@ -198,6 +204,9 @@ class GlimmerDenseModel(Decoder):
         cls, optimizers, model_parts, parallelism_context
     ) -> None:
         super()._register_optimizer_hooks(optimizers, model_parts, parallelism_context)
+        register_factored_moe_balancing_hook(
+            optimizers, model_parts, parallelism_context
+        )
         asynchronous_models = [
             model for model in model_parts if model.config.ple_async_training
         ]

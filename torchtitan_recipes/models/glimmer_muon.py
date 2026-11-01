@@ -59,7 +59,8 @@ _MUON_PATTERN = (
     r"shared_experts\.\d+\.w(?:13|2)\.weight|"
     r"moe\.routed_experts\.w(?:13|2)\.weight|"
     r"moe\.router\.gate\.weight|"
-    r"feed_forward\.w(?:13|2)\.weight"
+    r"feed_forward\.w(?:13|2)\.weight|"
+    r"feed_forward\.(?:w_gate|w_up|w_down|router_weight|gate_router_weight)"
     r")$"
 )
 
@@ -164,7 +165,17 @@ def glimmer_muon_optimizer(
 
         routed: list[str] = []
         feed_forward = getattr(layer, "feed_forward", None)
-        if feed_forward is not None:
+        if feed_forward is not None and hasattr(feed_forward, "num_experts"):
+            # Routed FFN (glimmer_dense factored_moe): stacked expert matrices
+            # get Newton-Schulz per expert; each router is one matrix.
+            ffn = f"{prefix}.feed_forward"
+            for name in ("w_gate", "w_up", "w_down"):
+                matrices[f"{ffn}.{name}"] = per_expert
+                routed.append(f"{ffn}.{name}")
+            matrices[f"{ffn}.router_weight"] = _owned(dense_axis)
+            if feed_forward.split:
+                matrices[f"{ffn}.gate_router_weight"] = _owned(dense_axis)
+        elif feed_forward is not None:
             matrices[f"{prefix}.feed_forward.w13.weight"] = _matrix_rows(dense_axis)
             matrices[f"{prefix}.feed_forward.w2.weight"] = _owned(dense_axis)
         for expert_id, _expert in enumerate(getattr(layer, "shared_experts", ())):

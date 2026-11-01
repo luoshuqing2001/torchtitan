@@ -33,6 +33,14 @@ becomes a GELU MLP of width ``qmlp_ratio * dim`` (``qmlp.py``); global layers
 keep a linear query. The default ratio 1.375 follows SMLA-4x
 (i_Q / hidden = 2432 / 1792).
 
+``arch="moe"`` replaces every FFN with a token-choice SwiGLU MoE of
+``moe_experts`` experts of width ``moe_hidden``, ``moe_top_k`` active
+(``factored_moe.py``). The defaults (32 experts, top 8, width 384) keep the
+dense FFN's active width (8 * 384 = 3072) and hold 4x its parameters.
+``arch="moe_split"`` has the same up/down pool and a separately routed pool
+of ``moe_gate_experts`` gate matrices (default the same sizes), so it matches
+``moe`` in parameters and FLOPs while composing 32 x 32 experts from them.
+
 ``arch="qmlpdeep"`` keeps the dense model's number of global (NoPE) layers,
 L / 4, and puts ``qmlp_swa_per_full`` (default 5) sliding-window layers before
 each, so the default has 1.5 L attention layers and no FFN. Global layers sit
@@ -73,6 +81,7 @@ from .deepseek_engram import (
     layer_multipliers,
     NUM_HEADS,
 )
+from .factored_moe import FactoredMoE
 from .engram import EngramTable, EngramUpdate, NGramEngram, rows_per_head_matching_ple
 from .model import GlimmerAttentionBlock, GlimmerDenseBlock, GlimmerDenseModel
 from .ple import _PLE_DIM, LayerPLE, PerLayerContext, PerLayerEmbedder, PLE_DIM_TIERS
@@ -102,7 +111,10 @@ _WINDOW_PATTERN = [512, 512, 512, 0]
 _NORM_EPS = 1e-5
 _POST_NORM_EPS = 1e-8
 _MAX_CONTEXT_LENGTH = 2048
-ARCHS = ("ffn", "qmlp", "qmlpdeep")
+ARCHS = ("ffn", "qmlp", "qmlpdeep", "moe", "moe_split")
+_MOE_EXPERTS = 32
+_MOE_TOP_K = 8
+_MOE_HIDDEN = 384
 _QMLP_RATIO = 1.375
 _QMLP_SWA_PER_FULL = 5
 _QMLPDEEP_RATIO = 2
@@ -280,6 +292,43 @@ def _deepseek_engram_config(
     )
 
 
+def _routed_ffn(
+    dim: int,
+    layer_id: int,
+    *,
+    split: bool,
+    experts: int,
+    top_k: int,
+    hidden: int,
+    gate_experts: int | None,
+    gate_top_k: int | None,
+) -> FactoredMoE.Config:
+    """Routed SwiGLU in place of the dense FFN, initialized like it.
+
+    Gate matrices and routers use the dense ``w1`` init; up and down use the
+    dense ``w2``/``w3`` depth-scaled init.
+    """
+    depth = _depth_init(layer_id)["weight"]
+    param_init = {
+        "router_weight": _LINEAR_INIT["weight"],
+        "w_gate": _LINEAR_INIT["weight"],
+        "w_up": depth,
+        "w_down": depth,
+    }
+    if split:
+        param_init["gate_router_weight"] = _LINEAR_INIT["weight"]
+    return FactoredMoE.Config(
+        dim=dim,
+        hidden_dim=hidden,
+        num_experts=experts,
+        top_k=top_k,
+        split=split,
+        num_gate_experts=gate_experts if split else None,
+        gate_top_k=gate_top_k if split else None,
+        param_init=param_init,
+    )
+
+
 def _query_mlp_attention(
     attention,
     *,
@@ -424,6 +473,11 @@ def _flavor_config(
     qmlp_zero_init: str = "mlp",
     swa_rotary_dim: int | None = None,
     swa_rotary_shared: bool = False,
+    moe_experts: int = _MOE_EXPERTS,
+    moe_top_k: int = _MOE_TOP_K,
+    moe_hidden: int = _MOE_HIDDEN,
+    moe_gate_experts: int | None = None,
+    moe_gate_top_k: int | None = None,
 ) -> GlimmerDenseModel.Config:
     n_heads = dim // head_dim if head_dim == _HEAD_DIM else _N_HEADS_AT_128[dim]
     swa_rope = (
@@ -548,11 +602,24 @@ def _flavor_config(
                 post_attention_norm=_gain_norm(dim, _POST_NORM_EPS, gain_center=1.0),
                 post_ffn_norm=_gain_norm(dim, _POST_NORM_EPS, gain_center=1.0),
                 attention=attention,
-                feed_forward=make_ffn_config(
-                    dim=dim,
-                    hidden_dim=hidden_dim,
-                    w1_param_init=_LINEAR_INIT,
-                    w2w3_param_init=_depth_init(layer_id),
+                feed_forward=(
+                    _routed_ffn(
+                        dim,
+                        layer_id,
+                        split=arch == "moe_split",
+                        experts=moe_experts,
+                        top_k=moe_top_k,
+                        hidden=moe_hidden,
+                        gate_experts=moe_gate_experts,
+                        gate_top_k=moe_gate_top_k,
+                    )
+                    if arch in ("moe", "moe_split")
+                    else make_ffn_config(
+                        dim=dim,
+                        hidden_dim=hidden_dim,
+                        w1_param_init=_LINEAR_INIT,
+                        w2w3_param_init=_depth_init(layer_id),
+                    )
                 ),
                 layer_ple=_layer_ple(dim, ple_dim) if memory == "ple" else None,
             )
@@ -613,6 +680,11 @@ def build_model_config(
     qmlp_zero_init: str = "mlp",
     swa_rotary_dim: int | None = None,
     swa_rotary_shared: bool = False,
+    moe_experts: int = _MOE_EXPERTS,
+    moe_top_k: int = _MOE_TOP_K,
+    moe_hidden: int = _MOE_HIDDEN,
+    moe_gate_experts: int | None = None,
+    moe_gate_top_k: int | None = None,
 ) -> GlimmerDenseModel.Config:
     dim, n_layers, max_context_len = MODEL_FLAVORS[flavor]
     context_len = seq_len or max_context_len
@@ -655,6 +727,11 @@ def build_model_config(
         qmlp_zero_init=qmlp_zero_init,
         swa_rotary_dim=swa_rotary_dim,
         swa_rotary_shared=swa_rotary_shared,
+        moe_experts=moe_experts,
+        moe_top_k=moe_top_k,
+        moe_hidden=moe_hidden,
+        moe_gate_experts=moe_gate_experts,
+        moe_gate_top_k=moe_gate_top_k,
     )
     if converters is not None:
         validate_converter_compatibility(converters)

@@ -1,0 +1,4 @@
+# Same as hd128_moe.txt, but the gate matrices are their own routed pool (32, top 8): composite
+# expert (i, j) = (W_gate[j], W_up[i], W_down[i]) weighted s_i * t_j, 32 x 32 experts, 64 active.
+# Same parameters and FLOPs as the standard MoE (plus one 32 x 1024 router per layer).
+d200m 0 128 ARCH=moe_split MOE_EXPERTS=32 MOE_TOP_K=8 MOE_HIDDEN=384 MOE_GATE_EXPERTS=32 MOE_GATE_TOP_K=8 HEAD_DIM=128 SWA_ROTARY_DIM=32 LR=1.4e-3 DATA_SHARDS=4 RUN_TAG=e32k8h384prope32hd128lr14ds4
