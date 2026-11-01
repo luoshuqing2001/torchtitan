@@ -423,8 +423,16 @@ def _flavor_config(
     qmlp_residual: bool = False,
     qmlp_zero_init: str = "mlp",
     swa_rotary_dim: int | None = None,
+    swa_rotary_shared: bool = False,
 ) -> GlimmerDenseModel.Config:
     n_heads = dim // head_dim if head_dim == _HEAD_DIM else _N_HEADS_AT_128[dim]
+    swa_rope = (
+        None
+        if swa_rotary_dim is None
+        else PartialRoPE.Config(
+            dim=swa_rotary_dim, max_context_length=seq_len, theta=_ROPE_THETA
+        )
+    )
     n_kv_heads = n_heads // 4
     hidden_dim = _FFN_MULTIPLIER * dim
     if arch == "qmlpdeep":
@@ -458,7 +466,7 @@ def _flavor_config(
                     dim=head_dim, max_context_length=seq_len, theta=_ROPE_THETA
                 )
             )
-            if not full and swa_rotary_dim is not None:
+            if not full and swa_rotary_dim is not None and swa_rotary_shared:
                 attention = _sgqa_attention(
                     attention,
                     dim=dim,
@@ -477,6 +485,8 @@ def _flavor_config(
                     residual=qmlp_residual,
                     zero_init=qmlp_zero_init,
                 )
+                if swa_rope is not None:
+                    attention.rope = swa_rope
             layers.append(
                 GlimmerAttentionBlock.Config(
                     attention_norm=_gain_norm(dim, _NORM_EPS, gain_center=1.0),
@@ -525,9 +535,12 @@ def _flavor_config(
             attn_backend=attn_backend,
         )
         if swa_rotary_dim is not None and attention.window_size is not None:
-            attention = _sgqa_attention(
-                attention, dim=dim, rotary_dim=swa_rotary_dim, seq_len=seq_len
-            )
+            if swa_rotary_shared:
+                attention = _sgqa_attention(
+                    attention, dim=dim, rotary_dim=swa_rotary_dim, seq_len=seq_len
+                )
+            else:
+                attention.rope = swa_rope
         layers.append(
             GlimmerDenseBlock.Config(
                 attention_norm=_gain_norm(dim, _NORM_EPS, gain_center=1.0),
@@ -599,6 +612,7 @@ def build_model_config(
     qmlp_residual: bool = False,
     qmlp_zero_init: str = "mlp",
     swa_rotary_dim: int | None = None,
+    swa_rotary_shared: bool = False,
 ) -> GlimmerDenseModel.Config:
     dim, n_layers, max_context_len = MODEL_FLAVORS[flavor]
     context_len = seq_len or max_context_len
@@ -640,6 +654,7 @@ def build_model_config(
         qmlp_residual=qmlp_residual,
         qmlp_zero_init=qmlp_zero_init,
         swa_rotary_dim=swa_rotary_dim,
+        swa_rotary_shared=swa_rotary_shared,
     )
     if converters is not None:
         validate_converter_compatibility(converters)

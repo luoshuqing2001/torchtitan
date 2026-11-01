@@ -193,10 +193,11 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
     ``QMLP_RESIDUAL=1`` adds a linear query path to the query MLP
     (``q = W_q x + W_down GELU(W_up x)``). ``QMLP_ZERO_INIT=mlp`` (default)
     zero-initializes ``W_down``; ``QMLP_ZERO_INIT=linear`` keeps the paper's MLP
-    init and zero-initializes ``W_q``. ``SWA_ROTARY_DIM=32`` gives every
-    sliding-window layer SGQA-style projections: of each 128-dim query/key head
-    only the last 32 dims are rotated, and the rotated key part is one head
-    shared by all KV groups (decoupled partial RoPE).
+    init and zero-initializes ``W_q``. ``SWA_ROTARY_DIM=32`` rotates only the
+    last 32 dims of each query/key head in every sliding-window layer (partial
+    RoPE, per head, fused QKV). ``SWA_ROTARY_SHARED=1`` instead gives those
+    layers SGQA-style projections whose rotated key part is one head shared by
+    all KV groups (decoupled RoPE).
 
     Matrix parameters use Moonlight Muon. Embeddings, norms, and the LM head
     stay on AdamW at the same base learning rate. The schedule is WSD: 2%
@@ -229,6 +230,7 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
     qmlp_residual = os.environ.get("QMLP_RESIDUAL", "0") == "1"
     qmlp_zero_init = os.environ.get("QMLP_ZERO_INIT", "mlp")
     swa_rotary_env = os.environ.get("SWA_ROTARY_DIM")
+    swa_rotary_shared = os.environ.get("SWA_ROTARY_SHARED", "0") == "1"
     use_fp8 = os.environ.get("FP8", "1") != "0"
     converters = []
     if use_fp8:
@@ -257,6 +259,7 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
         qmlp_residual=qmlp_residual,
         qmlp_zero_init=qmlp_zero_init,
         swa_rotary_dim=None if swa_rotary_env is None else int(swa_rotary_env),
+        swa_rotary_shared=swa_rotary_shared,
     )
     model_config.ple_async_training = ple_async_training
     model_config.ple_unbind_inputs = unbind_flag == "1"

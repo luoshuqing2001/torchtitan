@@ -15,11 +15,12 @@ from torchtitan.models.glimmer_dense import build_model_config
 from torchtitan.models.glimmer_dense.sgqa import PartialRoPE, SGQAProjection
 from torchtitan_recipes.models.glimmer_muon import _MUON_PATTERN, glimmer_muon_optimizer
 
-DENSE = dict(head_dim=128, swa_rotary_dim=32)
+DENSE = dict(head_dim=128, swa_rotary_dim=32, swa_rotary_shared=True)
 QMLP = dict(
     arch="qmlpdeep",
     head_dim=128,
     swa_rotary_dim=32,
+    swa_rotary_shared=True,
     qmlp_swa_per_full=5,
     qmlp_intermediate=2752,
     qmlp_residual=True,
@@ -102,3 +103,45 @@ def test_forward_runs(kwargs):
     with torch.no_grad():
         logits = model(tokens, positions, masks)
     assert logits.shape[-1] == 100352 and torch.isfinite(logits).all()
+
+
+PER_HEAD_DENSE = dict(head_dim=128, swa_rotary_dim=32)
+PER_HEAD_QMLP = dict(QMLP, swa_rotary_shared=False)
+
+
+@pytest.mark.parametrize(
+    "kwargs,expected",
+    [(PER_HEAD_DENSE, 260_097_024), (PER_HEAD_QMLP, 253_400_064)],
+    ids=["dense", "qmlp"],
+)
+def test_per_head_partial_rope_keeps_fused_projections(kwargs, expected):
+    from torchtitan.models.glimmer_dense.qmlp import QueryMLPKVLinear
+
+    with torch.device("meta"):
+        model = build_model_config("d200m", **kwargs).build()
+    assert sum(p.numel() for p in model.parameters()) == expected
+    for layer in model.layers.values():
+        attention = layer.attention
+        if attention.window_size is not None:
+            assert isinstance(attention.rope, PartialRoPE)
+            assert attention.rope.config.dim == 32
+            assert isinstance(attention.qkv_linear, (QKVLinear, QueryMLPKVLinear))
+        else:
+            assert attention.rope is None
+
+
+@pytest.mark.parametrize("kwargs", [PER_HEAD_DENSE, PER_HEAD_QMLP], ids=["dense", "qmlp"])
+def test_per_head_partial_rope_forward_and_muon(kwargs):
+    torch.manual_seed(0)
+    config = build_model_config("d200m", seq_len=256, **kwargs)
+    optimizer = glimmer_muon_optimizer(config, lr=1.4e-3, parallelism=ParallelismConfig())
+    layouts = optimizer.optimizers[0].compute_sharding_by_fqn
+    model = config.build()
+    model.init_states()
+    for name, p in model.named_parameters():
+        if name.startswith("layers.") and p.ndim == 2:
+            assert re.search(_MUON_PATTERN, name) and name in layouts, name
+    tokens, positions = torch.randint(0, 1000, (256,)), torch.arange(256)
+    with torch.no_grad():
+        logits = model(tokens, positions, model.get_attention_masks(positions))
+    assert torch.isfinite(logits).all()
