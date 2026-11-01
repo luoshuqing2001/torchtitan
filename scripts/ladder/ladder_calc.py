@@ -1,6 +1,8 @@
 import torch
 from torchtitan.models.glimmer_dense import build_model_config
 
+import sys
+SPF = int(sys.argv[1]) if len(sys.argv) > 1 else 7
 V, T, W = 100352, 2048, 512
 FULL_CTX = (T + 1) / 2
 SWA_CTX = (W * (W + 1) / 2 + (T - W) * W) / T
@@ -22,7 +24,7 @@ def build(fl, iq=None):
         if iq is None:
             return build_model_config(fl, head_dim=128).build()
         return build_model_config(
-            fl, arch="qmlpdeep", head_dim=128, qmlp_swa_per_full=7,
+            fl, arch="qmlpdeep", head_dim=128, qmlp_swa_per_full=SPF,
             qmlp_intermediate=iq, qmlp_residual=True,
         ).build()
 
@@ -42,6 +44,6 @@ for fl in ["d200m", "d400m", "d700m", "d1b"]:
     nq, fq = out[iq_r]
     print(f"{fl}: hidden {dim} heads {a.n_heads}/{a.n_kv_heads}  dense {len(d.layers)}L {nd/1e6:.1f}M "
           f"FLOPs/tok {fd/1e9:.3f}G  tokens {D/1e9:.2f}B  DeepSeek lr {lr:.2e} batch {B/1e3:.0f}K")
-    print(f"    qmlp 7:1 iQ=1.375x ({iq_r}): {nq/1e6:.1f}M ({(nq/nd-1)*100:+.1f}%) FLOPs {(fq/fd-1)*100:+.1f}%"
+    print(f"    qmlp {SPF}:1 iQ=1.375x ({iq_r}): {nq/1e6:.1f}M ({(nq/nd-1)*100:+.1f}%) FLOPs {(fq/fd-1)*100:+.1f}%"
           f"   | largest iQ with FLOPs<=dense: {by_f} ({by_f/dim:.2f}x, params {(out[by_f][0]/nd-1)*100:+.1f}%)"
           f"   | largest iQ with params<=dense: {by_p} ({by_p/dim:.2f}x, FLOPs {(out[by_p][1]/fd-1)*100:+.1f}%)")
