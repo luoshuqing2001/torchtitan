@@ -1,3 +1,4 @@
-# New ladder, d200m pure Q-MLP (no linear residual), SMLA-4x width iQ 1408 = 1.375 x dim, paper MLP init;
-# 5 SWA per global layer, per-head partial RoPE (32 of 128 dims) on SWA layers. 24.5% fewer params, 21% fewer FLOPs than dense.
-d200m 0 128 ARCH=qmlpdeep QMLP_SWA_PER_FULL=5 QMLP_INTERMEDIATE=1408 HEAD_DIM=128 SWA_ROTARY_DIM=32 LR=1.4e-3 DATA_SHARDS=4 RUN_TAG=s5q1408prope32hd128lr14ds4
+# New ladder, d200m pure Q-MLP (no linear residual), SGQA-4x width iQ 2368 (2.31 x dim; paper SGQA-4x is
+# 4096/1792 = 2.29), paper MLP init; 5 SWA per global layer, per-head partial RoPE (32 of 128) on SWA layers.
+# 13.2% fewer params and 10.5% fewer FLOPs/token than dense.
+d200m 0 128 ARCH=qmlpdeep QMLP_SWA_PER_FULL=5 QMLP_INTERMEDIATE=2368 HEAD_DIM=128 SWA_ROTARY_DIM=32 LR=1.4e-3 DATA_SHARDS=4 RUN_TAG=s5q2368prope32hd128lr14ds4
