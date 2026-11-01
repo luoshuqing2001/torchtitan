@@ -232,3 +232,29 @@ def test_qmlp_linear_residual_uses_muon():
     for name in names:
         assert re.search(_MUON_PATTERN, name), name
         assert name in layouts, name
+
+
+def test_qmlp_linear_zero_init_keeps_paper_mlp_init():
+    torch.manual_seed(0)
+    model = build_model_config(
+        "d200m",
+        arch="qmlpdeep",
+        head_dim=128,
+        qmlp_swa_per_full=7,
+        qmlp_intermediate=1344,
+        qmlp_residual=True,
+        qmlp_zero_init="linear",
+    ).build()
+    model.init_states()
+    qkv = model.layers["0"].attention.qkv_linear
+    assert torch.count_nonzero(qkv.wq.weight) == 0
+    assert qkv.q_up.weight.std().item() == pytest.approx(
+        GELU_GAIN / math.sqrt(1024), rel=0.02
+    )
+    assert qkv.q_down.weight.std().item() == pytest.approx(
+        1 / math.sqrt(1344), rel=0.02
+    )
+    x = torch.randn(16, 1024)
+    xq, _, _ = qkv(x)
+    mlp = qkv.q_down(torch.nn.functional.gelu(qkv.q_up(x)))
+    torch.testing.assert_close(xq.reshape(16, -1), mlp)

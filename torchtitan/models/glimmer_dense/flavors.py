@@ -280,18 +280,31 @@ def _deepseek_engram_config(
 
 
 def _query_mlp_attention(
-    attention, *, dim: int, intermediate: int, residual: bool = False
+    attention,
+    *,
+    dim: int,
+    intermediate: int,
+    residual: bool = False,
+    zero_init: str = "mlp",
 ):
     """Replace a sliding-window layer's fused QKV with a query MLP + linear KV.
 
-    With ``residual`` the query also gets a linear path, ``q = W_q x + MLP(x)``,
-    initialized like the dense query, and ``W_down`` starts at zero so the layer
-    starts as standard GQA.
+    With ``residual`` the query also gets a linear path, ``q = W_q x + MLP(x)``.
+    ``zero_init="mlp"`` starts ``W_down`` at zero and ``W_q`` like the dense
+    query, so the layer starts as standard GQA. ``zero_init="linear"`` keeps the
+    activation-calibrated MLP init and starts ``W_q`` at zero, so the layer
+    starts as the pure query MLP.
     """
     qkv = attention.qkv_linear
     up_init, down_init = query_mlp_param_init(dim, intermediate)
+    wq_init = _LINEAR_INIT
     if residual:
-        down_init = {"weight": nn.init.zeros_}
+        if zero_init == "mlp":
+            down_init = {"weight": nn.init.zeros_}
+        elif zero_init == "linear":
+            wq_init = {"weight": nn.init.zeros_}
+        else:
+            raise ValueError(f"zero_init must be 'mlp' or 'linear', got {zero_init!r}")
     attention.qkv_linear = QueryMLPKVLinear.Config(
         head_dim=qkv.head_dim,
         n_heads=qkv.n_heads,
@@ -313,7 +326,7 @@ def _query_mlp_attention(
             Linear.Config(
                 in_features=dim,
                 out_features=qkv.n_heads * qkv.head_dim,
-                param_init=_LINEAR_INIT,
+                param_init=wq_init,
             )
             if residual
             else None
@@ -337,6 +350,7 @@ def _flavor_config(
     qmlp_swa_per_full: int = _QMLP_SWA_PER_FULL,
     head_dim: int = _HEAD_DIM,
     qmlp_residual: bool = False,
+    qmlp_zero_init: str = "mlp",
 ) -> GlimmerDenseModel.Config:
     n_heads = dim // head_dim if head_dim == _HEAD_DIM else _N_HEADS_AT_128[dim]
     n_kv_heads = n_heads // 4
@@ -379,6 +393,7 @@ def _flavor_config(
                     dim=dim,
                     intermediate=qmlp_intermediate,
                     residual=qmlp_residual,
+                    zero_init=qmlp_zero_init,
                 )
             layers.append(
                 GlimmerAttentionBlock.Config(
@@ -495,6 +510,7 @@ def build_model_config(
     qmlp_swa_per_full: int = _QMLP_SWA_PER_FULL,
     head_dim: int = _HEAD_DIM,
     qmlp_residual: bool = False,
+    qmlp_zero_init: str = "mlp",
 ) -> GlimmerDenseModel.Config:
     dim, n_layers, max_context_len = MODEL_FLAVORS[flavor]
     context_len = seq_len or max_context_len
@@ -532,6 +548,7 @@ def build_model_config(
         qmlp_swa_per_full=qmlp_swa_per_full,
         head_dim=head_dim,
         qmlp_residual=qmlp_residual,
+        qmlp_zero_init=qmlp_zero_init,
     )
     if converters is not None:
         validate_converter_compatibility(converters)

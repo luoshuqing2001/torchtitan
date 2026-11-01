@@ -191,7 +191,9 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
     (default 2 * dim). ``HEAD_DIM=128`` uses 128-dim heads with 8 / 12 / 16 / 20
     query heads (GQA 4:1) at the same hidden sizes and depths.
     ``QMLP_RESIDUAL=1`` adds a linear query path to the query MLP
-    (``q = W_q x + W_down GELU(W_up x)``, ``W_down`` initialized to zero).
+    (``q = W_q x + W_down GELU(W_up x)``). ``QMLP_ZERO_INIT=mlp`` (default)
+    zero-initializes ``W_down``; ``QMLP_ZERO_INIT=linear`` keeps the paper's MLP
+    init and zero-initializes ``W_q``.
 
     Matrix parameters use Moonlight Muon. Embeddings, norms, and the LM head
     stay on AdamW at the same base learning rate. The schedule is WSD: 2%
@@ -222,6 +224,7 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
     qmlp_swa_per_full = int(os.environ.get("QMLP_SWA_PER_FULL", "5"))
     head_dim = int(os.environ.get("HEAD_DIM", "64"))
     qmlp_residual = os.environ.get("QMLP_RESIDUAL", "0") == "1"
+    qmlp_zero_init = os.environ.get("QMLP_ZERO_INIT", "mlp")
     use_fp8 = os.environ.get("FP8", "1") != "0"
     converters = []
     if use_fp8:
@@ -248,6 +251,7 @@ def glimmer_dense(seq_len: int | None = None) -> Trainer.Config:
         qmlp_swa_per_full=qmlp_swa_per_full,
         head_dim=head_dim,
         qmlp_residual=qmlp_residual,
+        qmlp_zero_init=qmlp_zero_init,
     )
     model_config.ple_async_training = ple_async_training
     model_config.ple_unbind_inputs = unbind_flag == "1"
