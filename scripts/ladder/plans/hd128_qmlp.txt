@@ -1,4 +1,4 @@
-# New ladder, d200m pure Q-MLP (no linear residual), SGQA-4x width iQ 2368 (2.31 x dim; paper SGQA-4x is
-# 4096/1792 = 2.29), paper MLP init; 5 SWA per global layer, per-head partial RoPE (32 of 128) on SWA layers.
-# 13.2% fewer params and 10.5% fewer FLOPs/token than dense.
-d200m 0 128 ARCH=qmlpdeep QMLP_SWA_PER_FULL=5 QMLP_INTERMEDIATE=2368 HEAD_DIM=128 SWA_ROTARY_DIM=32 LR=1.4e-3 DATA_SHARDS=4 RUN_TAG=s5q2368prope32hd128lr14ds4
+# New ladder, d200m pure Q-MLP (no linear residual), iQ 2560 = 2.5 x dim, paper MLP init; 5 SWA per global layer,
+# per-head partial RoPE (32 of 128) on SWA layers. 10.9% fewer params and 8.3% fewer FLOPs/token than dense.
+# 1 GPU with micro batch 256 (gradient accumulation 1), DATA_SHARDS=4: exactly the 4-GPU data.
+d200m 0 256 ARCH=qmlpdeep QMLP_SWA_PER_FULL=5 QMLP_INTERMEDIATE=2560 HEAD_DIM=128 SWA_ROTARY_DIM=32 LR=1.4e-3 DATA_SHARDS=4 RUN_TAG=s5q2560prope32hd128lr14ds4acc1
