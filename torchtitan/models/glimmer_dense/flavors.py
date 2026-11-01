@@ -77,6 +77,7 @@ from .engram import EngramTable, EngramUpdate, NGramEngram, rows_per_head_matchi
 from .model import GlimmerAttentionBlock, GlimmerDenseBlock, GlimmerDenseModel
 from .ple import _PLE_DIM, LayerPLE, PerLayerContext, PerLayerEmbedder, PLE_DIM_TIERS
 from .qmlp import query_mlp_param_init, QueryMLPKVLinear
+from .sgqa import PartialRoPE, SGQAProjection
 
 __all__ = [
     "MODEL_FLAVORS",
@@ -335,6 +336,76 @@ def _query_mlp_attention(
     return attention
 
 
+def _sgqa_attention(
+    attention,
+    *,
+    dim: int,
+    rotary_dim: int,
+    seq_len: int,
+    intermediate: int | None = None,
+    residual: bool = False,
+    zero_init: str = "mlp",
+):
+    """Give a sliding-window layer SGQA-style projections and partial RoPE.
+
+    Query/key heads keep ``head_dim`` with the last ``rotary_dim`` rotated; the
+    rotated key part is one head shared by all KV groups. The query is linear
+    (``intermediate=None``) or a query MLP, plus a linear residual when
+    ``residual`` (``zero_init`` as in ``_query_mlp_attention``).
+    """
+    qkv = attention.qkv_linear
+    head_dim, n_heads, n_kv = qkv.head_dim, qkv.n_heads, qkv.n_kv_heads
+    if not 0 < rotary_dim < head_dim or rotary_dim % 2:
+        raise ValueError(f"rotary_dim must be even and in (0, {head_dim})")
+    q_width = n_heads * head_dim
+    wq = q_up = q_down = None
+    if intermediate is None:
+        wq = Linear.Config(in_features=dim, out_features=q_width, param_init=_LINEAR_INIT)
+    else:
+        up_init, down_init = query_mlp_param_init(dim, intermediate)
+        if residual:
+            wq_init = _LINEAR_INIT
+            if zero_init == "mlp":
+                down_init = {"weight": nn.init.zeros_}
+            elif zero_init == "linear":
+                wq_init = {"weight": nn.init.zeros_}
+            else:
+                raise ValueError(
+                    f"zero_init must be 'mlp' or 'linear', got {zero_init!r}"
+                )
+            wq = Linear.Config(in_features=dim, out_features=q_width, param_init=wq_init)
+        q_up = Linear.Config(
+            in_features=dim, out_features=intermediate, param_init=up_init
+        )
+        q_down = Linear.Config(
+            in_features=intermediate, out_features=q_width, param_init=down_init
+        )
+    attention.qkv_linear = SGQAProjection.Config(
+        head_dim=head_dim,
+        n_heads=n_heads,
+        n_kv_heads=n_kv,
+        rotary_dim=rotary_dim,
+        wq=wq,
+        q_up=q_up,
+        q_down=q_down,
+        wk=Linear.Config(
+            in_features=dim,
+            out_features=n_kv * (head_dim - rotary_dim),
+            param_init=_LINEAR_INIT,
+        ),
+        wk_rope=Linear.Config(
+            in_features=dim, out_features=rotary_dim, param_init=_LINEAR_INIT
+        ),
+        wv=Linear.Config(
+            in_features=dim, out_features=n_kv * head_dim, param_init=_LINEAR_INIT
+        ),
+    )
+    attention.rope = PartialRoPE.Config(
+        dim=rotary_dim, max_context_length=seq_len, theta=_ROPE_THETA
+    )
+    return attention
+
+
 def _flavor_config(
     dim: int,
     n_layers: int,
@@ -351,6 +422,7 @@ def _flavor_config(
     head_dim: int = _HEAD_DIM,
     qmlp_residual: bool = False,
     qmlp_zero_init: str = "mlp",
+    swa_rotary_dim: int | None = None,
 ) -> GlimmerDenseModel.Config:
     n_heads = dim // head_dim if head_dim == _HEAD_DIM else _N_HEADS_AT_128[dim]
     n_kv_heads = n_heads // 4
@@ -386,7 +458,17 @@ def _flavor_config(
                     dim=head_dim, max_context_length=seq_len, theta=_ROPE_THETA
                 )
             )
-            if not full:
+            if not full and swa_rotary_dim is not None:
+                attention = _sgqa_attention(
+                    attention,
+                    dim=dim,
+                    rotary_dim=swa_rotary_dim,
+                    seq_len=seq_len,
+                    intermediate=qmlp_intermediate,
+                    residual=qmlp_residual,
+                    zero_init=qmlp_zero_init,
+                )
+            elif not full:
                 assert qmlp_intermediate is not None
                 attention = _query_mlp_attention(
                     attention,
@@ -431,23 +513,28 @@ def _flavor_config(
                 )
             )
             continue
+        attention = _build_muse_glimmer_attention(
+            layer_id=layer_id,
+            n_layers=n_layers,
+            dim=dim,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            max_context_length=seq_len,
+            window_pattern=_WINDOW_PATTERN,
+            attn_backend=attn_backend,
+        )
+        if swa_rotary_dim is not None and attention.window_size is not None:
+            attention = _sgqa_attention(
+                attention, dim=dim, rotary_dim=swa_rotary_dim, seq_len=seq_len
+            )
         layers.append(
             GlimmerDenseBlock.Config(
                 attention_norm=_gain_norm(dim, _NORM_EPS, gain_center=1.0),
                 ffn_norm=_gain_norm(dim, _NORM_EPS, gain_center=1.0),
                 post_attention_norm=_gain_norm(dim, _POST_NORM_EPS, gain_center=1.0),
                 post_ffn_norm=_gain_norm(dim, _POST_NORM_EPS, gain_center=1.0),
-                attention=_build_muse_glimmer_attention(
-                    layer_id=layer_id,
-                    n_layers=n_layers,
-                    dim=dim,
-                    n_heads=n_heads,
-                    n_kv_heads=n_kv_heads,
-                    head_dim=head_dim,
-                    max_context_length=seq_len,
-                    window_pattern=_WINDOW_PATTERN,
-                    attn_backend=attn_backend,
-                ),
+                attention=attention,
                 feed_forward=make_ffn_config(
                     dim=dim,
                     hidden_dim=hidden_dim,
@@ -511,6 +598,7 @@ def build_model_config(
     head_dim: int = _HEAD_DIM,
     qmlp_residual: bool = False,
     qmlp_zero_init: str = "mlp",
+    swa_rotary_dim: int | None = None,
 ) -> GlimmerDenseModel.Config:
     dim, n_layers, max_context_len = MODEL_FLAVORS[flavor]
     context_len = seq_len or max_context_len
@@ -526,6 +614,8 @@ def build_model_config(
         )
     if ple_dim not in PLE_DIM_TIERS:
         raise ValueError(f"ple_dim must be one of {PLE_DIM_TIERS}, got {ple_dim}")
+    if swa_rotary_dim is not None and arch == "qmlp":
+        raise ValueError("swa_rotary_dim supports arch 'ffn' and 'qmlpdeep'")
     if head_dim not in HEAD_DIMS:
         raise ValueError(f"head_dim must be one of {HEAD_DIMS}, got {head_dim}")
     if arch not in ARCHS:
@@ -549,6 +639,7 @@ def build_model_config(
         head_dim=head_dim,
         qmlp_residual=qmlp_residual,
         qmlp_zero_init=qmlp_zero_init,
+        swa_rotary_dim=swa_rotary_dim,
     )
     if converters is not None:
         validate_converter_compatibility(converters)

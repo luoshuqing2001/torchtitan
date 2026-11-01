@@ -53,7 +53,7 @@ def glimmer_wsd_scheduler(steps: int) -> LRSchedulersContainer.Config:
 _MUON_PATTERN = (
     r"(?:"
     r"attention\.qkv_linear\.wqkv\.weight|"
-    r"attention\.qkv_linear\.(?:q_up|q_down|wkv|wq)\.weight|"
+    r"attention\.qkv_linear\.(?:q_up|q_down|wkv|wq|wk|wk_rope|wv)\.weight|"
     r"attention\.wo\.weight|"
     r"attention\.o_gate\.weight|"
     r"shared_experts\.\d+\.w(?:13|2)\.weight|"
@@ -127,7 +127,23 @@ def glimmer_muon_optimizer(
             raise ValueError(f"layer {layer_id} attention has no head_dim")
         prefix = f"layers.{layer_id}"
         qkv = f"{prefix}.attention.qkv_linear"
-        if hasattr(attention.qkv_linear, "q_up"):
+        rotary_dim = getattr(attention.qkv_linear, "rotary_dim", None)
+        if rotary_dim is not None:
+            # SGQA projections: Q and V rows are heads, K rows are the
+            # non-rotated part of each KV head; the shared rotated key and
+            # W_up are single matrices.
+            proj = attention.qkv_linear
+            matrices = {
+                f"{qkv}.wk.weight": _per_head(dense_axis, head_dim - rotary_dim),
+                f"{qkv}.wk_rope.weight": _owned(dense_axis),
+                f"{qkv}.wv.weight": _per_head(dense_axis, head_dim),
+            }
+            if proj.wq is not None:
+                matrices[f"{qkv}.wq.weight"] = _per_head(dense_axis, head_dim)
+            if proj.q_up is not None:
+                matrices[f"{qkv}.q_up.weight"] = _owned(dense_axis)
+                matrices[f"{qkv}.q_down.weight"] = _per_head(dense_axis, head_dim)
+        elif hasattr(attention.qkv_linear, "q_up"):
             # Query MLP (arch="qmlp"): W_up is one matrix; W_down's rows are
             # query heads and the fused KV's rows are K/V heads, so both get
             # per-head Newton-Schulz like wqkv.

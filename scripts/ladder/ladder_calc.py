@@ -3,6 +3,7 @@ from torchtitan.models.glimmer_dense import build_model_config
 
 import sys
 SPF = int(sys.argv[1]) if len(sys.argv) > 1 else 7
+ROT = int(sys.argv[2]) if len(sys.argv) > 2 else None  # SWA_ROTARY_DIM
 V, T, W = 100352, 2048, 512
 FULL_CTX = (T + 1) / 2
 SWA_CTX = (W * (W + 1) / 2 + (T - W) * W) / T
@@ -22,10 +23,10 @@ def stats(m, dim):
 def build(fl, iq=None):
     with torch.device("meta"):
         if iq is None:
-            return build_model_config(fl, head_dim=128).build()
+            return build_model_config(fl, head_dim=128, swa_rotary_dim=ROT).build()
         return build_model_config(
             fl, arch="qmlpdeep", head_dim=128, qmlp_swa_per_full=SPF,
-            qmlp_intermediate=iq, qmlp_residual=True,
+            qmlp_intermediate=iq, qmlp_residual=True, swa_rotary_dim=ROT,
         ).build()
 
 
